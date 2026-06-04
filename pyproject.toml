@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "manga-translation-pipeline"
+version = "0.1.0"
+description = "本地漫画 OCR、翻译、去字与嵌字 Web 流水线"
+readme = "README.md"
+requires-python = ">=3.11,<3.12"
+license = "GPL-3.0-only"
+dependencies = [
+  "fastapi>=0.111,<1",
+  "httpx>=0.27,<0.28",
+  "opencv-python>=4.10,<5",
+  "pillow>=10.4,<12",
+  "python-multipart>=0.0.9,<1",
+  "uvicorn[standard]>=0.30,<1",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.2,<9",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.setuptools]
+packages = ["manga_pipeline"]

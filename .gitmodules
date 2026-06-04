@@ -1,0 +1,4 @@
+[submodule "vendor/manga-image-translator"]
+	path = vendor/manga-image-translator
+	url = https://github.com/zyddnys/manga-image-translator.git
+	shallow = true
