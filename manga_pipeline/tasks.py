@@ -24,6 +24,32 @@ class TaskManager:
         if not self.worker_task or self.worker_task.done():
             self.worker_task = asyncio.create_task(self._worker())
 
+    def _build_engine(
+        self,
+        config: dict[str, Any],
+        progress_callback,
+        log_callback,
+    ) -> CoreEngine:
+        settings = self.secrets.get()
+        provider = create_provider(config["provider"], settings, config.get("ollama_model"))
+        polish_provider = None
+        if config.get("polish_with_ollama"):
+            polish_model = config.get("polish_model") or config.get("ollama_model")
+            if not polish_model:
+                raise RuntimeError("开启 Ollama 润色时必须选择润色模型")
+            polish_provider = OllamaProvider(settings["ollama_base_url"], polish_model)
+        return CoreEngine(
+            provider=provider,
+            source_language=config["source_language"],
+            target_language=config["target_language"],
+            polish_provider=polish_provider,
+            render_direction=config.get("render_direction", "auto"),
+            render_alignment=config.get("render_alignment", "auto"),
+            font_size=config.get("font_size"),
+            progress_callback=progress_callback,
+            log_callback=log_callback,
+        )
+
     async def enqueue(self, task_id: str) -> None:
         await self.queue.put(task_id)
 
@@ -52,15 +78,6 @@ class TaskManager:
         if not task:
             return
         config = task["config"]
-        settings = self.secrets.get()
-        provider = create_provider(config["provider"], settings, config.get("ollama_model"))
-        polish_provider = None
-        if config.get("polish_with_ollama"):
-            polish_model = config.get("polish_model") or config.get("ollama_model")
-            if not polish_model:
-                raise RuntimeError("开启 Ollama 润色时必须选择润色模型")
-            polish_provider = OllamaProvider(settings["ollama_base_url"], polish_model)
-
         self.database.update_task(
             task_id, status="running", current_stage="starting", error=None
         )
@@ -101,17 +118,7 @@ class TaskManager:
                     task_id, level, stage, message, image_id=image_id, details=details
                 )
 
-            engine = CoreEngine(
-                provider=provider,
-                source_language=config["source_language"],
-                target_language=config["target_language"],
-                polish_provider=polish_provider,
-                render_direction=config.get("render_direction", "auto"),
-                render_alignment=config.get("render_alignment", "auto"),
-                font_size=config.get("font_size"),
-                progress_callback=progress,
-                log_callback=log,
-            )
+            engine = self._build_engine(config, progress, log)
             self.database.log(
                 task_id,
                 "INFO",
@@ -180,3 +187,48 @@ class TaskManager:
                 Path(image["input_path"]),
                 updates,
             )
+
+    async def reprocess_image(
+        self,
+        image: dict[str, Any],
+        updates: list[dict[str, Any]],
+        changed_indices: list[int],
+    ) -> list[dict[str, Any]]:
+        task = self.database.get_task(image["task_id"])
+        if not task:
+            raise RuntimeError("图片所属任务不存在")
+
+        async def progress(stage: str, fraction: float):
+            self.database.update_image(
+                image["id"], status="running", stage=stage, progress=fraction
+            )
+
+        async def log(
+            level: str,
+            stage: str,
+            message: str,
+            details: dict[str, Any] | None,
+        ):
+            self.database.log(
+                image["task_id"],
+                level,
+                stage,
+                message,
+                image_id=image["id"],
+                details=details,
+            )
+
+        async with self.processing_lock:
+            engine = self._build_engine(task["config"], progress, log)
+            regions = await engine.reprocess_regions(
+                Path(image["input_path"]),
+                Path(image["output_path"]),
+                Path(image["context_path"]),
+                Path(image["regions_path"]),
+                updates,
+                changed_indices,
+            )
+            self.database.update_image(
+                image["id"], status="completed", stage="saved", progress=1.0
+            )
+            return regions

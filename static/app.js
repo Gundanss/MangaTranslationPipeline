@@ -11,6 +11,9 @@ const state = {
   activeImage: null,
   regions: [],
   activeRegion: null,
+  editorMode: "ocr",
+  dirtyOcrIndices: new Set(),
+  dragState: null,
 };
 
 const stageNames = {
@@ -20,6 +23,7 @@ const stageNames = {
   translating: "翻译中", "after-translating": "翻译校验", "mask-generation": "生成去字掩膜",
   inpainting: "去除原文", rendering: "自动嵌字", saved: "保存结果",
   finished: "已完成", error: "处理失败", rerender: "重新嵌字", retry: "翻译重试",
+  "manual-ocr": "人工 OCR 框",
 };
 const statusNames = {
   queued: "排队中", running: "处理中", completed: "已完成",
@@ -225,20 +229,109 @@ function renderImageStrip(images) {
   });
 }
 
+function ensureRegionShape(region, index) {
+  const fallback = region.render_bbox || region.ocr_bbox || region.bbox || [0, 0, 80, 80];
+  region.index = index;
+  region.ocr_bbox = region.ocr_bbox || fallback;
+  region.render_bbox = region.render_bbox || fallback;
+  region.bbox = region.render_bbox;
+  region.enabled = region.enabled !== false;
+  region.font_size = region.font_size || 32;
+  region.direction = region.direction || "auto";
+  region.alignment = region.alignment || "auto";
+  region.foreground = region.foreground || "#000000";
+  region.outline = region.outline || "#FFFFFF";
+  region.text = region.text || "";
+  region.translation = region.translation || "";
+  return region;
+}
+
+function bboxField() {
+  return state.editorMode === "ocr" ? "ocr_bbox" : "render_bbox";
+}
+
+function getRegionBBox(region) {
+  return [...(region[bboxField()] || region.bbox || [0, 0, 80, 80])];
+}
+
+function imagePixelSize() {
+  const image = $("resultImage");
+  return { width: image.naturalWidth || 1, height: image.naturalHeight || 1 };
+}
+
+function clampBBox(bbox) {
+  const { width, height } = imagePixelSize();
+  let [x1, y1, x2, y2] = bbox.map((value) => Math.round(Number(value) || 0));
+  x1 = Math.max(0, Math.min(width, x1));
+  x2 = Math.max(0, Math.min(width, x2));
+  y1 = Math.max(0, Math.min(height, y1));
+  y2 = Math.max(0, Math.min(height, y2));
+  [x1, x2] = x1 <= x2 ? [x1, x2] : [x2, x1];
+  [y1, y2] = y1 <= y2 ? [y1, y2] : [y2, y1];
+  if (x2 - x1 < 2) x2 = Math.min(width, x1 + 2);
+  if (y2 - y1 < 2) y2 = Math.min(height, y1 + 2);
+  return [x1, y1, x2, y2];
+}
+
+function markOcrDirty(index) {
+  state.dirtyOcrIndices.add(index);
+}
+
+function setRegionBBox(region, bbox) {
+  const next = clampBBox(bbox);
+  const current = region[bboxField()] || region.bbox || [];
+  const changed = current.length !== 4 || current.some((value, index) => value !== next[index]);
+  if (state.editorMode === "ocr") {
+    region.ocr_bbox = next;
+    if (changed) markOcrDirty(region.index);
+  } else {
+    region.render_bbox = next;
+    region.bbox = next;
+  }
+  updateBBoxInputs(region);
+}
+
+function editorImageUrl() {
+  if (!state.activeImage) return "";
+  const url = state.editorMode === "ocr"
+    ? state.activeImage.original_url
+    : state.activeImage.result_url;
+  return `${url}?t=${Date.now()}`;
+}
+
+function loadEditorImage() {
+  const image = $("resultImage");
+  image.onload = renderOverlays;
+  image.src = editorImageUrl();
+  $("canvasModeLabel").textContent = state.editorMode === "ocr"
+    ? "原图 OCR 识别框"
+    : "翻译结果译文框";
+  $("ocrModeButton").classList.toggle("active", state.editorMode === "ocr");
+  $("renderModeButton").classList.toggle("active", state.editorMode === "render");
+}
+
+function setEditorMode(mode) {
+  syncActiveRegion();
+  const active = state.activeRegion;
+  state.activeRegion = null;
+  state.editorMode = mode;
+  loadEditorImage();
+  if (active !== null) selectRegion(active);
+}
+
 async function openImage(image) {
   state.activeImage = image;
   state.activeRegion = null;
+  state.dirtyOcrIndices.clear();
   try {
     const data = await api(image.regions_url);
-    state.regions = data.regions;
-    const resultImage = $("resultImage");
-    resultImage.onload = renderOverlays;
-    resultImage.src = `${image.result_url}?t=${Date.now()}`;
+    state.regions = data.regions.map(ensureRegionShape);
     $("openOriginal").href = image.original_url;
     $("canvasWrap").classList.add("ready");
     $("editorFields").classList.add("hidden");
     document.querySelector(".editor-placeholder").classList.remove("hidden");
     $("editorMessage").textContent = "";
+    loadEditorImage();
     renderImageStrip(state.activeTask.images);
   } catch (error) {
     $("editorMessage").textContent = error.message;
@@ -248,6 +341,7 @@ async function openImage(image) {
 function renderOverlays() {
   const image = $("resultImage");
   const overlay = $("regionOverlay");
+  if (!image.naturalWidth || !state.activeImage) return;
   const rect = image.getBoundingClientRect();
   const wrapRect = $("canvasWrap").getBoundingClientRect();
   const scaleX = rect.width / image.naturalWidth;
@@ -257,18 +351,102 @@ function renderOverlays() {
   overlay.style.width = `${rect.width}px`;
   overlay.style.height = `${rect.height}px`;
   overlay.innerHTML = "";
-  state.regions.forEach((region) => {
-    const [x1, y1, x2, y2] = region.bbox;
+  state.regions.forEach((region, index) => {
+    ensureRegionShape(region, index);
+    const [x1, y1, x2, y2] = getRegionBBox(region);
     const box = document.createElement("button");
-    box.className = `region-box ${state.activeRegion === region.index ? "active" : ""}`;
+    const classes = [
+      "region-box",
+      state.editorMode === "render" ? "render" : "",
+      state.activeRegion === region.index ? "active" : "",
+      region.enabled ? "" : "disabled",
+    ].filter(Boolean);
+    box.className = classes.join(" ");
     box.style.left = `${x1 * scaleX}px`;
     box.style.top = `${y1 * scaleY}px`;
     box.style.width = `${Math.max(12, (x2 - x1) * scaleX)}px`;
     box.style.height = `${Math.max(12, (y2 - y1) * scaleY)}px`;
     box.textContent = region.index + 1;
-    box.onclick = () => selectRegion(region.index);
+    box.onpointerdown = (event) => startBoxDrag(event, region.index, null);
+    if (state.activeRegion === region.index) {
+      ["nw", "n", "ne", "e", "se", "s", "sw", "w"].forEach((handle) => {
+        const grip = document.createElement("span");
+        grip.className = `resize-handle ${handle}`;
+        grip.onpointerdown = (event) => startBoxDrag(event, region.index, handle);
+        box.append(grip);
+      });
+    }
     overlay.append(box);
   });
+}
+
+function pointerToPixel(event) {
+  const image = $("resultImage");
+  const rect = image.getBoundingClientRect();
+  const scaleX = image.naturalWidth / rect.width;
+  const scaleY = image.naturalHeight / rect.height;
+  return {
+    x: (event.clientX - rect.left) * scaleX,
+    y: (event.clientY - rect.top) * scaleY,
+  };
+}
+
+function startBoxDrag(event, index, handle) {
+  event.preventDefault();
+  event.stopPropagation();
+  selectRegion(index);
+  state.dragState = {
+    index,
+    handle,
+    startPoint: pointerToPixel(event),
+    startBBox: getRegionBBox(state.regions[index]),
+  };
+  window.addEventListener("pointermove", moveBoxDrag);
+  window.addEventListener("pointerup", endBoxDrag, { once: true });
+}
+
+function moveBoxDrag(event) {
+  if (!state.dragState) return;
+  const region = state.regions[state.dragState.index];
+  const point = pointerToPixel(event);
+  const dx = point.x - state.dragState.startPoint.x;
+  const dy = point.y - state.dragState.startPoint.y;
+  let [x1, y1, x2, y2] = state.dragState.startBBox;
+  const handle = state.dragState.handle;
+  if (!handle) {
+    x1 += dx; x2 += dx; y1 += dy; y2 += dy;
+  } else {
+    if (handle.includes("w")) x1 += dx;
+    if (handle.includes("e")) x2 += dx;
+    if (handle.includes("n")) y1 += dy;
+    if (handle.includes("s")) y2 += dy;
+  }
+  setRegionBBox(region, [x1, y1, x2, y2]);
+  renderOverlays();
+}
+
+function endBoxDrag() {
+  window.removeEventListener("pointermove", moveBoxDrag);
+  state.dragState = null;
+}
+
+function updateBBoxInputs(region) {
+  const [x1, y1, x2, y2] = getRegionBBox(region);
+  $("regionX").value = x1;
+  $("regionY").value = y1;
+  $("regionW").value = x2 - x1;
+  $("regionH").value = y2 - y1;
+  $("regionBox").textContent = `${x1}, ${y1}, ${x2}, ${y2}`;
+}
+
+function syncBoxInputs() {
+  if (state.activeRegion === null) return;
+  const region = state.regions[state.activeRegion];
+  const x = Number($("regionX").value);
+  const y = Number($("regionY").value);
+  const width = Number($("regionW").value);
+  const height = Number($("regionH").value);
+  setRegionBBox(region, [x, y, x + width, y + height]);
 }
 
 function selectRegion(index) {
@@ -278,7 +456,6 @@ function selectRegion(index) {
   document.querySelector(".editor-placeholder").classList.add("hidden");
   $("editorFields").classList.remove("hidden");
   $("regionNumber").textContent = `区域 #${index + 1}`;
-  $("regionBox").textContent = region.bbox.join(", ");
   $("regionText").value = region.text;
   $("regionTranslation").value = region.translation;
   $("regionFontSize").value = region.font_size;
@@ -286,6 +463,8 @@ function selectRegion(index) {
   $("regionAlignment").value = ["auto", "left", "center", "right"].includes(region.alignment) ? region.alignment : "auto";
   $("regionForeground").value = region.foreground;
   $("regionOutline").value = region.outline;
+  $("toggleRegionButton").textContent = region.enabled ? "禁用区域" : "恢复区域";
+  updateBBoxInputs(region);
   renderOverlays();
 }
 
@@ -299,6 +478,79 @@ function syncActiveRegion() {
   region.alignment = $("regionAlignment").value;
   region.foreground = $("regionForeground").value;
   region.outline = $("regionOutline").value;
+  syncBoxInputs();
+}
+
+function addRegion() {
+  if (!state.activeImage || !$("resultImage").naturalWidth) return;
+  syncActiveRegion();
+  state.editorMode = "ocr";
+  const { width, height } = imagePixelSize();
+  const boxWidth = Math.max(80, Math.round(width * 0.12));
+  const boxHeight = Math.max(80, Math.round(height * 0.12));
+  const x1 = Math.round((width - boxWidth) / 2);
+  const y1 = Math.round((height - boxHeight) / 2);
+  const bbox = [x1, y1, x1 + boxWidth, y1 + boxHeight];
+  const index = state.regions.length;
+  state.regions.push(ensureRegionShape({
+    index,
+    bbox,
+    ocr_bbox: bbox,
+    render_bbox: bbox,
+    enabled: true,
+    text: "",
+    translation: "",
+    font_size: 32,
+    direction: "auto",
+    alignment: "auto",
+    foreground: "#000000",
+    outline: "#FFFFFF",
+  }, index));
+  markOcrDirty(index);
+  loadEditorImage();
+  selectRegion(index);
+}
+
+function toggleRegion() {
+  if (state.activeRegion === null) return;
+  const region = state.regions[state.activeRegion];
+  region.enabled = !region.enabled;
+  markOcrDirty(region.index);
+  $("toggleRegionButton").textContent = region.enabled ? "禁用区域" : "恢复区域";
+  renderOverlays();
+}
+
+async function reprocessRegions() {
+  if (!state.activeImage) return;
+  syncActiveRegion();
+  const changed = [...state.dirtyOcrIndices].filter((index) => state.regions[index]);
+  if (!changed.length) {
+    $("editorMessage").textContent = "没有需要重新识别的 OCR 框";
+    return;
+  }
+  $("reprocessButton").disabled = true;
+  $("rerenderButton").disabled = true;
+  $("editorMessage").textContent = "正在重新识别、翻译、去字并嵌字...";
+  try {
+    const data = await api(`/api/images/${state.activeImage.id}/reprocess-regions`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ regions: state.regions, changed_indices: changed }),
+    });
+    state.regions = data.regions.map(ensureRegionShape);
+    state.dirtyOcrIndices.clear();
+    if (state.activeRegion !== null && state.activeRegion >= state.regions.length) {
+      state.activeRegion = state.regions.length ? state.regions.length - 1 : null;
+    }
+    loadEditorImage();
+    if (state.activeRegion !== null) selectRegion(state.activeRegion);
+    $("editorMessage").textContent = "OCR 框重处理完成";
+  } catch (error) {
+    $("editorMessage").textContent = error.message;
+  } finally {
+    $("reprocessButton").disabled = false;
+    $("rerenderButton").disabled = false;
+  }
 }
 
 async function rerenderImage() {
@@ -312,8 +564,9 @@ async function rerenderImage() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ regions: state.regions }),
     });
-    state.regions = data.regions;
-    $("resultImage").src = `${data.result_url}?t=${Date.now()}`;
+    state.regions = data.regions.map(ensureRegionShape);
+    loadEditorImage();
+    if (state.activeRegion !== null) selectRegion(state.activeRegion);
     $("editorMessage").textContent = "重新嵌字完成";
   } catch (error) {
     $("editorMessage").textContent = error.message;
@@ -392,11 +645,23 @@ function bindEvents() {
   $("refreshModels").onclick = loadModels;
   $("startButton").onclick = createTask;
   $("refreshTasks").onclick = loadTasks;
+  $("ocrModeButton").onclick = () => setEditorMode("ocr");
+  $("renderModeButton").onclick = () => setEditorMode("render");
+  $("addRegionButton").onclick = addRegion;
+  $("toggleRegionButton").onclick = toggleRegion;
+  $("reprocessButton").onclick = reprocessRegions;
   $("rerenderButton").onclick = rerenderImage;
   $("clearLogView").onclick = () => { state.logs.clear(); $("logWindow").innerHTML = '<div class="empty-state">日志显示已清空</div>'; };
   $("settingsButton").onclick = () => $("settingsDialog").showModal();
   $("saveSettings").onclick = saveSettings;
+  ["regionX", "regionY", "regionW", "regionH"].forEach((id) => {
+    $(id).onchange = () => {
+      syncBoxInputs();
+      renderOverlays();
+    };
+  });
   window.addEventListener("resize", renderOverlays);
+  $("canvasWrap").addEventListener("scroll", renderOverlays);
   document.querySelectorAll(".tab").forEach((tab) => {
     tab.onclick = () => {
       document.querySelectorAll(".tab").forEach((item) => item.classList.toggle("active", item === tab));

@@ -219,6 +219,10 @@ small, .muted { color: var(--muted); font-size: 11px; }
 .canvas-column { min-width: 0; padding: 16px; background: #302f2c; }
 .compare-labels { color: #fff; font-size: 12px; margin-bottom: 10px; }
 .compare-labels a { color: #ffc2aa; text-decoration: none; }
+.box-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 10px; }
+.segmented { display: inline-grid; grid-template-columns: 1fr 1fr; border: 1px solid #595650; border-radius: 8px; overflow: hidden; }
+.segmented button { border: 0; background: #3b3934; color: #e8e2d8; padding: 8px 14px; font-size: 12px; font-weight: 800; }
+.segmented button.active { background: var(--accent); color: #fff; }
 .canvas-wrap {
   position: relative;
   min-height: 500px;
@@ -245,12 +249,37 @@ small, .muted { color: var(--muted); font-size: 11px; }
   font-size: 10px;
   font-weight: 800;
   text-shadow: 0 1px 2px #000;
+  cursor: move;
 }
+.region-box.render {
+  border-color: rgba(55,213,255,.95);
+  background: rgba(55,213,255,.14);
+}
+.region-box.disabled { opacity: .42; border-style: dashed; }
 .region-box:hover, .region-box.active { border-color: #37d5ff; background: rgba(55,213,255,.18); }
+.region-box.render:hover, .region-box.render.active { border-color: #ffcc4d; background: rgba(255,204,77,.18); }
+.resize-handle {
+  position: absolute;
+  width: 10px;
+  height: 10px;
+  border: 1px solid #1d1d1b;
+  background: #fff;
+  pointer-events: auto;
+}
+.resize-handle.nw { left: -6px; top: -6px; cursor: nwse-resize; }
+.resize-handle.n { left: 50%; top: -6px; transform: translateX(-50%); cursor: ns-resize; }
+.resize-handle.ne { right: -6px; top: -6px; cursor: nesw-resize; }
+.resize-handle.e { right: -6px; top: 50%; transform: translateY(-50%); cursor: ew-resize; }
+.resize-handle.se { right: -6px; bottom: -6px; cursor: nwse-resize; }
+.resize-handle.s { left: 50%; bottom: -6px; transform: translateX(-50%); cursor: ns-resize; }
+.resize-handle.sw { left: -6px; bottom: -6px; cursor: nesw-resize; }
+.resize-handle.w { left: -6px; top: 50%; transform: translateY(-50%); cursor: ew-resize; }
 .region-editor { padding: 16px; border-left: 1px solid var(--line); background: var(--surface); }
 .editor-placeholder { color: var(--muted); font-size: 12px; padding: 30px 8px; text-align: center; }
 .region-title { margin-bottom: 12px; }
 .region-title span:first-child { color: var(--accent-dark); font-size: 12px; font-weight: 800; }
+.grid-four { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; }
+.grid-four input { min-width: 0; }
 .color-fields { display: flex; gap: 8px; }
 .color-fields label { flex: 1; font-size: 11px; }
 .color-fields input { height: 40px; padding: 3px; }

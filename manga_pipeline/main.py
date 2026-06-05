@@ -36,7 +36,7 @@ from .providers import (
     list_ollama_models,
     sanitize_translation_text,
 )
-from .schemas import RerenderRequest, SettingsUpdate, TaskConfig
+from .schemas import ReprocessRegionsRequest, RerenderRequest, SettingsUpdate, TaskConfig
 from .secret_store import SecretStore
 from .tasks import TaskManager
 
@@ -91,6 +91,35 @@ def _task_public(task: dict) -> dict:
     if "images" in task:
         result["images"] = [_image_public(image) for image in task["images"]]
     return result
+
+
+def _normalize_region_json(regions: list[dict]) -> tuple[list[dict], bool]:
+    changed = False
+    normalized: list[dict] = []
+    for index, region in enumerate(regions):
+        item = dict(region)
+        bbox = item.get("bbox") or item.get("render_bbox") or item.get("ocr_bbox")
+        if item.get("index") != index:
+            item["index"] = index
+            changed = True
+        if "ocr_bbox" not in item and bbox:
+            item["ocr_bbox"] = bbox
+            changed = True
+        if "render_bbox" not in item and bbox:
+            item["render_bbox"] = bbox
+            changed = True
+        if item.get("bbox") != item.get("render_bbox") and item.get("render_bbox"):
+            item["bbox"] = item["render_bbox"]
+            changed = True
+        if "enabled" not in item:
+            item["enabled"] = True
+            changed = True
+        cleaned = sanitize_translation_text(item.get("translation", ""))
+        if cleaned != item.get("translation", ""):
+            item["translation"] = cleaned
+            changed = True
+        normalized.append(item)
+    return normalized, changed
 
 
 async def _validate_config(config: TaskConfig) -> None:
@@ -291,13 +320,9 @@ async def get_regions(image_id: str):
     path = Path(image["regions_path"])
     if not path.exists():
         raise HTTPException(status_code=404, detail="文本区域尚未生成")
-    regions = json.loads(path.read_text(encoding="utf-8"))
-    changed = False
-    for region in regions:
-        cleaned = sanitize_translation_text(region.get("translation", ""))
-        if cleaned != region.get("translation", ""):
-            region["translation"] = cleaned
-            changed = True
+    regions, changed = _normalize_region_json(
+        json.loads(path.read_text(encoding="utf-8"))
+    )
     if changed:
         path.write_text(
             json.dumps(regions, ensure_ascii=False, indent=2), encoding="utf-8"
@@ -336,6 +361,42 @@ async def rerender_image(image_id: str, request: RerenderRequest):
         image_id=image_id,
     )
     return {"ok": True, "regions": regions, "result_url": f"/api/images/{image_id}/file/result"}
+
+
+@app.post("/api/images/{image_id}/reprocess-regions")
+async def reprocess_regions(image_id: str, request: ReprocessRegionsRequest):
+    image = database.get_image(image_id)
+    if not image:
+        raise HTTPException(status_code=404, detail="图片不存在")
+    if not Path(image["context_path"]).exists():
+        raise HTTPException(status_code=409, detail="缺少可重新处理的上下文")
+    try:
+        regions = await manager.reprocess_image(
+            image,
+            [region.model_dump() for region in request.regions],
+            request.changed_indices,
+        )
+    except Exception as exc:
+        database.log(
+            image["task_id"],
+            "ERROR",
+            "manual-ocr",
+            f"人工 OCR 框重处理失败：{exc}",
+            image_id=image_id,
+        )
+        raise HTTPException(status_code=500, detail=f"人工 OCR 框重处理失败：{exc}") from exc
+    database.log(
+        image["task_id"],
+        "INFO",
+        "manual-ocr",
+        "人工 OCR 框调整后重新处理完成",
+        image_id=image_id,
+    )
+    return {
+        "ok": True,
+        "regions": regions,
+        "result_url": f"/api/images/{image_id}/file/result",
+    }
 
 
 @app.exception_handler(Exception)
