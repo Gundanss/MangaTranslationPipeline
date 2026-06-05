@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from .db import Database
-from .engine import CoreEngine, rerender
+from .engine import CoreEngine, rerender, trim_runtime_memory
 from .providers import OllamaProvider, create_provider
 from .secret_store import SecretStore
 
@@ -150,6 +150,8 @@ class TaskManager:
                     details={"traceback": traceback.format_exc()},
                 )
             finally:
+                if completed == total - 1 or (completed + 1) % 5 == 0:
+                    trim_runtime_memory()
                 self.database.update_task(task_id, completed_files=completed + 1)
 
         status = "completed_with_errors" if failures else "completed"
@@ -175,5 +177,6 @@ class TaskManager:
                 Path(image["context_path"]),
                 Path(image["regions_path"]),
                 Path(image["output_path"]),
+                Path(image["input_path"]),
                 updates,
             )

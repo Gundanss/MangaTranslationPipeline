@@ -8,6 +8,7 @@ from manga_pipeline.providers import (
     TranslatorProvider,
     _parse_single_response,
     _parse_tagged_response,
+    sanitize_translation_text,
 )
 
 
@@ -28,6 +29,18 @@ def test_parse_tagged_response_rejects_empty_translation():
 
 def test_parse_single_response_accepts_untagged_translation():
     assert _parse_single_response("译文：可以直接使用") == "可以直接使用"
+
+
+def test_sanitize_translation_text_strips_model_tags():
+    assert (
+        sanitize_translation_text("翻译：可以直接使用</|1|></|2|>")
+        == "可以直接使用"
+    )
+
+
+def test_parse_tagged_response_strips_malformed_closing_tags():
+    response = "<|1|>第一句</|1|>\n<|2|>第二句</|2|>"
+    assert _parse_tagged_response(response, 2) == ["第一句", "第二句"]
 
 
 def test_ollama_falls_back_to_single_regions_when_batch_format_is_invalid():

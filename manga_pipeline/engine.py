@@ -1,18 +1,20 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import inspect
 import json
 import pickle
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Awaitable, Callable
 
 import numpy as np
 from PIL import Image
 
 from .config import MODEL_DIR, VENDOR_CORE_DIR
-from .providers import OllamaProvider, TranslatorProvider
+from .providers import OllamaProvider, TranslatorProvider, sanitize_translation_text
 
 ProgressCallback = Callable[[str, float], Awaitable[None]]
 LogCallback = Callable[[str, str, str, dict[str, Any] | None], Awaitable[None]]
@@ -61,7 +63,7 @@ def _import_core():
         from manga_translator.detection import unload as unload_detection
         from manga_translator.inpainting import unload as unload_inpainting
         from manga_translator.ocr import unload as unload_ocr
-        from manga_translator.utils import ModelWrapper, dump_image
+        from manga_translator.utils import ModelWrapper, dump_image, load_image
     except Exception as exc:
         raise CoreUnavailableError(
             f"漫画处理核心依赖尚未安装，请运行“首次安装.command”：{exc}"
@@ -79,6 +81,7 @@ def _import_core():
         "Ocr": Ocr,
         "Translator": Translator,
         "dump_image": dump_image,
+        "load_image": load_image,
         "unload_detection": unload_detection,
         "unload_inpainting": unload_inpainting,
         "unload_ocr": unload_ocr,
@@ -158,6 +161,69 @@ async def _reset_model_caches_for_cpu() -> None:
     await core["unload_inpainting"](core["Inpainter"].lama_large)
 
 
+def trim_runtime_memory(release_accelerator_cache: bool = True) -> None:
+    gc.collect()
+    if not release_accelerator_cache:
+        return
+    try:
+        import torch
+
+        if hasattr(torch, "mps") and hasattr(torch.mps, "empty_cache"):
+            torch.mps.empty_cache()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        return
+
+
+def _copy_image_array(image: Any) -> np.ndarray | None:
+    if image is None:
+        return None
+    return np.ascontiguousarray(np.array(image, copy=True))
+
+
+def _extract_clean_inpainted_image(ctx: Any) -> np.ndarray:
+    gimp_mask = getattr(ctx, "gimp_mask", None)
+    if isinstance(gimp_mask, np.ndarray) and gimp_mask.ndim == 3 and gimp_mask.shape[2] >= 3:
+        return np.ascontiguousarray(gimp_mask[..., :3][:, :, ::-1].copy())
+    if getattr(ctx, "img_inpainted", None) is None:
+        raise RuntimeError("缺少可重新嵌字的去字底图")
+    return _copy_image_array(ctx.img_inpainted)
+
+
+def _build_rerender_payload(ctx: Any, config: Any) -> dict[str, Any]:
+    return {
+        "config": config,
+        "text_regions": ctx.text_regions,
+        "img_rgb": _copy_image_array(ctx.img_rgb),
+        "img_inpainted": _extract_clean_inpainted_image(ctx),
+        "img_alpha": getattr(ctx, "img_alpha", None),
+    }
+
+
+def _normalize_rerender_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    if "ctx" in payload:
+        legacy_ctx = payload["ctx"]
+        return {
+            "config": payload["config"],
+            "text_regions": legacy_ctx.text_regions,
+            "img_rgb": _copy_image_array(legacy_ctx.img_rgb),
+            "img_inpainted": _extract_clean_inpainted_image(legacy_ctx),
+            "img_alpha": getattr(legacy_ctx, "img_alpha", None),
+        }
+    required = {"config", "text_regions", "img_rgb", "img_inpainted"}
+    missing = required - set(payload)
+    if missing:
+        raise RuntimeError(f"重新嵌字上下文缺少必要字段：{', '.join(sorted(missing))}")
+    return payload
+
+
+def _save_rerender_payload(context_path: Path, payload: dict[str, Any]) -> None:
+    context_path.parent.mkdir(parents=True, exist_ok=True)
+    with context_path.open("wb") as file:
+        pickle.dump(payload, file, protocol=pickle.HIGHEST_PROTOCOL)
+
+
 def serialize_regions(regions: list[Any]) -> list[dict[str, Any]]:
     result: list[dict[str, Any]] = []
     for index, region in enumerate(regions or []):
@@ -168,7 +234,9 @@ def serialize_regions(regions: list[Any]) -> list[dict[str, Any]]:
                 "index": index,
                 "bbox": xyxy,
                 "text": region.text,
-                "translation": getattr(region, "translation", ""),
+                "translation": sanitize_translation_text(
+                    getattr(region, "translation", "")
+                ),
                 "font_size": max(6, int(region.font_size)),
                 "direction": _public_direction(
                     getattr(region, "_direction", "auto")
@@ -380,6 +448,8 @@ class CoreEngine:
     ) -> list[dict[str, Any]]:
         core, translator = self._build(use_gpu)
         config = self._config(core, use_gpu)
+        image = None
+        ctx = None
 
         def hook(state: str, finished: bool = False):
             stage = state.split(":", 1)[0]
@@ -391,35 +461,58 @@ class CoreEngine:
             return asyncio.create_task(callback)
 
         translator.add_progress_hook(hook)
-        with Image.open(input_path) as source:
-            image = source.convert("RGBA") if source.mode == "RGBA" else source.convert("RGB")
-        ctx = await translator.translate(image, config)
-        if not ctx.result:
-            raise RuntimeError("核心处理完成但未生成输出图片")
-        _save_image(ctx.result, output_path)
-        regions = serialize_regions(ctx.text_regions)
-        context_path.parent.mkdir(parents=True, exist_ok=True)
-        with context_path.open("wb") as file:
-            pickle.dump({"ctx": ctx, "config": config}, file)
-        regions_path.parent.mkdir(parents=True, exist_ok=True)
-        regions_path.write_text(
-            json.dumps(regions, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
-        await self.progress_callback("saved", 1.0)
-        return regions
+        try:
+            with Image.open(input_path) as source:
+                image = source.convert("RGBA") if source.mode == "RGBA" else source.convert("RGB")
+            ctx = await translator.translate(image, config)
+            if not ctx.result:
+                raise RuntimeError("核心处理完成但未生成输出图片")
+            rerender_payload = _build_rerender_payload(ctx, config)
+            _save_image(ctx.result, output_path)
+            regions = serialize_regions(ctx.text_regions)
+            _save_rerender_payload(context_path, rerender_payload)
+            regions_path.parent.mkdir(parents=True, exist_ok=True)
+            regions_path.write_text(
+                json.dumps(regions, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+            await self.progress_callback("saved", 1.0)
+            return regions
+        finally:
+            if ctx is not None:
+                for field in (
+                    "gimp_mask",
+                    "img_colorized",
+                    "img_inpainted",
+                    "img_rendered",
+                    "mask",
+                    "mask_raw",
+                    "result",
+                    "textlines",
+                    "upscaled",
+                ):
+                    if field in ctx:
+                        ctx[field] = None
+            trim_runtime_memory()
 
 
 async def rerender(
     context_path: Path,
     regions_path: Path,
     output_path: Path,
+    input_path: Path,
     updates: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
     core = _import_core()
     with context_path.open("rb") as file:
-        payload = pickle.load(file)
-    ctx = payload["ctx"]
+        payload = _normalize_rerender_payload(pickle.load(file))
     config = payload["config"]
+    ctx = SimpleNamespace(
+        text_regions=payload["text_regions"],
+        img_rgb=payload["img_rgb"],
+        img_inpainted=_copy_image_array(payload["img_inpainted"]),
+        img_alpha=payload.get("img_alpha"),
+        render_mask=None,
+    )
     if len(updates) != len(ctx.text_regions):
         raise ValueError("提交的文本区域数量与已保存上下文不一致")
     if {update["index"] for update in updates} != set(range(len(ctx.text_regions))):
@@ -428,7 +521,7 @@ async def rerender(
     for update in updates:
         region = ctx.text_regions[update["index"]]
         region.text = update["text"]
-        region.translation = update["translation"]
+        region.translation = sanitize_translation_text(update["translation"])
         region.font_size = update["font_size"]
         region._direction = _core_direction(update["direction"])
         region._alignment = update["alignment"]
@@ -453,14 +546,26 @@ async def rerender(
             "ignore_errors": False,
         }
     )
-    rendered = await translator._run_text_rendering(config, ctx)
-    ctx.img_rendered = rendered
-    ctx.result = core["dump_image"](ctx.input, rendered, ctx.img_alpha)
-    _save_image(ctx.result, output_path)
-    regions = serialize_regions(ctx.text_regions)
-    regions_path.write_text(
-        json.dumps(regions, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
-    with context_path.open("wb") as file:
-        pickle.dump({"ctx": ctx, "config": config}, file)
-    return regions
+    try:
+        rendered = await translator._run_text_rendering(config, ctx)
+        with Image.open(input_path) as source:
+            base_image = source.copy()
+        result = core["dump_image"](base_image, rendered, ctx.img_alpha)
+        _save_image(result, output_path)
+        regions = serialize_regions(ctx.text_regions)
+        regions_path.write_text(
+            json.dumps(regions, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        _save_rerender_payload(
+            context_path,
+            {
+                "config": config,
+                "text_regions": ctx.text_regions,
+                "img_rgb": payload["img_rgb"],
+                "img_inpainted": _copy_image_array(payload["img_inpainted"]),
+                "img_alpha": payload.get("img_alpha"),
+            },
+        )
+        return regions
+    finally:
+        trim_runtime_memory()

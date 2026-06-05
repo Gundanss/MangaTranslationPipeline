@@ -30,7 +30,12 @@ from .config import (
     safe_relative_path,
 )
 from .db import Database
-from .providers import TranslationError, create_provider, list_ollama_models
+from .providers import (
+    TranslationError,
+    create_provider,
+    list_ollama_models,
+    sanitize_translation_text,
+)
 from .schemas import RerenderRequest, SettingsUpdate, TaskConfig
 from .secret_store import SecretStore
 from .tasks import TaskManager
@@ -286,9 +291,20 @@ async def get_regions(image_id: str):
     path = Path(image["regions_path"])
     if not path.exists():
         raise HTTPException(status_code=404, detail="文本区域尚未生成")
+    regions = json.loads(path.read_text(encoding="utf-8"))
+    changed = False
+    for region in regions:
+        cleaned = sanitize_translation_text(region.get("translation", ""))
+        if cleaned != region.get("translation", ""):
+            region["translation"] = cleaned
+            changed = True
+    if changed:
+        path.write_text(
+            json.dumps(regions, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
     return {
         "image": _image_public(image),
-        "regions": json.loads(path.read_text(encoding="utf-8")),
+        "regions": regions,
     }
 
 

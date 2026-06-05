@@ -60,11 +60,27 @@ def _tagged_prompt(texts: list[str]) -> str:
     return "\n".join(f"<|{index + 1}|>{text}" for index, text in enumerate(texts))
 
 
+_MODEL_TAG_PATTERN = re.compile(r"(?:<\|\d+\|>|</\|\d+\|>|<\|/\d+\|>)")
+
+
+def sanitize_translation_text(text: str) -> str:
+    cleaned = text.strip()
+    cleaned = re.sub(r"^```(?:\w+)?\s*|\s*```$", "", cleaned, flags=re.DOTALL)
+    cleaned = _MODEL_TAG_PATTERN.sub("", cleaned)
+    cleaned = re.sub(
+        r"^(?:译文|翻译|translation)\s*[:：]\s*",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    return cleaned.strip()
+
+
 def _parse_tagged_response(response: str, expected: int) -> list[str]:
     matches = re.findall(
         r"<\|(\d+)\|>\s*(.*?)(?=<\|\d+\|>|$)", response, flags=re.DOTALL
     )
-    parsed = {int(index): value.strip() for index, value in matches}
+    parsed = {int(index): sanitize_translation_text(value) for index, value in matches}
     if len(parsed) != expected or any(index not in parsed for index in range(1, expected + 1)):
         raise TranslationError("模型返回的区域编号与 OCR 区域数量不一致")
     results = [parsed[index] for index in range(1, expected + 1)]
@@ -77,14 +93,7 @@ def _parse_single_response(response: str) -> str:
     try:
         return _parse_tagged_response(response, 1)[0]
     except TranslationError:
-        cleaned = response.strip()
-        cleaned = re.sub(r"^```(?:\w+)?\s*|\s*```$", "", cleaned, flags=re.DOTALL)
-        cleaned = re.sub(
-            r"^(?:译文|翻译|translation)\s*[:：]\s*",
-            "",
-            cleaned,
-            flags=re.IGNORECASE,
-        ).strip()
+        cleaned = sanitize_translation_text(response)
         if not cleaned:
             raise TranslationError("模型返回了空翻译")
         return cleaned
