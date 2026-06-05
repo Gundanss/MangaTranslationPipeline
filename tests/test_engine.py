@@ -136,6 +136,7 @@ def test_rerender_uses_clean_background_and_latest_translation(tmp_path, monkeyp
         async def _run_text_rendering(self, config, ctx):
             assert ctx.text_regions[0].translation == "new text"
             assert ctx.text_regions[0].xyxy.tolist() == [1, 0, 3, 4]
+            assert ctx.text_regions[0].target_lang == "CHS"
             return ctx.img_inpainted + 5
 
     monkeypatch.setattr(
@@ -349,3 +350,170 @@ def test_reprocess_regions_returns_new_ocr_and_translation(tmp_path, monkeypatch
         payload = pickle.load(file)
     assert payload["text_regions"][0].text == "new ocr"
     assert payload["text_regions"][0].translation == "new translation"
+
+
+def test_reprocess_manual_box_detects_and_merges_inner_textlines(
+    tmp_path, monkeypatch
+):
+    clean = np.zeros((12, 12, 3), dtype=np.uint8)
+    input_path = tmp_path / "input.png"
+    output_path = tmp_path / "output.png"
+    context_path = tmp_path / "context.pkl"
+    regions_path = tmp_path / "regions.json"
+    Image.fromarray(clean).save(input_path)
+
+    with context_path.open("wb") as file:
+        pickle.dump(
+            {
+                "config": SimpleNamespace(),
+                "text_regions": [],
+                "img_rgb": clean.copy(),
+                "img_inpainted": clean.copy(),
+                "img_alpha": None,
+            },
+            file,
+        )
+
+    class FakeQuadrilateral:
+        def __init__(self, pts, text, prob, *colors):
+            self.pts = np.array(pts)
+            self.text = text
+            self.prob = prob
+            self._fg = np.array(colors[:3] or (20, 20, 20))
+            self._bg = np.array(colors[3:6] or (240, 240, 240))
+
+        @property
+        def fg_colors(self):
+            return self._fg
+
+        @property
+        def bg_colors(self):
+            return self._bg
+
+    class FakeTextBlock(FakeRegion):
+        def __init__(
+            self,
+            lines,
+            texts=None,
+            font_size=12,
+            translation="",
+            fg_color=(0, 0, 0),
+            bg_color=(255, 255, 255),
+            **_kwargs,
+        ):
+            super().__init__(translation)
+            self.lines = np.array(lines)
+            self.text = (texts or [""])[0]
+            self.font_size = font_size
+            self._fg = np.array(fg_color)
+            self._bg = np.array(bg_color)
+
+    class FakeMergedRegion(FakeRegion):
+        def __init__(self, text):
+            super().__init__("")
+            self.text = text
+
+    class FakeTranslator:
+        def add_progress_hook(self, _hook):
+            return None
+
+        async def _run_detection(self, config, ctx):
+            assert ctx.img_rgb.shape == (8, 8, 3)
+            return (
+                [
+                    FakeQuadrilateral(
+                        [[4, 0], [7, 0], [7, 7], [4, 7]], "", 1
+                    ),
+                    FakeQuadrilateral(
+                        [[1, 0], [3, 0], [3, 7], [1, 7]], "", 1
+                    ),
+                ],
+                None,
+                None,
+            )
+
+        async def _run_ocr(self, config, ctx):
+            ctx.textlines[0].text = "右"
+            ctx.textlines[1].text = "左"
+            return ctx.textlines
+
+        async def _run_textline_merge(self, config, ctx):
+            assert ctx.textlines[0].pts[:, 0].min() >= 2
+            assert ctx.textlines[0].pts[:, 1].min() >= 2
+            return [FakeMergedRegion("右"), FakeMergedRegion("左")]
+
+        async def _run_mask_refinement(self, config, ctx):
+            return np.zeros((12, 12), dtype=np.uint8)
+
+        async def _run_inpainting(self, config, ctx):
+            return clean.copy()
+
+        async def _run_text_rendering(self, config, ctx):
+            assert ctx.text_regions[0].text == "右左"
+            assert ctx.text_regions[0].translation == "合并译文"
+            assert ctx.text_regions[0].target_lang == "CHS"
+            return clean + 9
+
+    monkeypatch.setattr(engine, "_mps_available", lambda: False)
+    monkeypatch.setattr(
+        engine.CoreEngine,
+        "_build",
+        lambda self, use_gpu: (
+            {
+                "Quadrilateral": FakeQuadrilateral,
+                "TextBlock": FakeTextBlock,
+                "dump_image": lambda base_image, rendered, alpha: Image.fromarray(
+                    rendered
+                ),
+            },
+            FakeTranslator(),
+        ),
+    )
+    monkeypatch.setattr(
+        engine.CoreEngine,
+        "_config",
+        lambda self, core, use_gpu: SimpleNamespace(),
+    )
+    monkeypatch.setattr(engine, "_save_rerender_payload", lambda *_args: None)
+
+    runner = engine.CoreEngine(
+        DummyProvider({"右左": "合并译文"}),
+        "ja",
+        "zh-CN",
+        None,
+        "auto",
+        "auto",
+        None,
+        lambda *_args, **_kwargs: asyncio.sleep(0),
+        lambda *_args, **_kwargs: asyncio.sleep(0),
+    )
+
+    regions = asyncio.run(
+        runner.reprocess_regions(
+            input_path,
+            output_path,
+            context_path,
+            regions_path,
+            [
+                {
+                    "index": 0,
+                    "bbox": [2, 2, 10, 10],
+                    "ocr_bbox": [2, 2, 10, 10],
+                    "render_bbox": [2, 2, 10, 10],
+                    "enabled": True,
+                    "text": "",
+                    "translation": "",
+                    "font_size": 24,
+                    "direction": "auto",
+                    "alignment": "auto",
+                    "foreground": "#000000",
+                    "outline": "#FFFFFF",
+                }
+            ],
+            [0],
+        )
+    )
+
+    assert regions[0]["text"] == "右左"
+    assert regions[0]["translation"] == "合并译文"
+    assert np.array_equal(np.array(Image.open(output_path)), clean + 9)

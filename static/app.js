@@ -199,6 +199,7 @@ function activateTask(taskId) {
 function renderTask() {
   const task = state.activeTask;
   if (!task) return;
+  syncActiveImageFromTask();
   $("activeTaskName").textContent = task.name;
   $("activeTaskMeta").textContent =
     `${task.config.source_language === "ja" ? "日语" : "英语"} → ${task.config.target_language} · ${task.config.provider} · 输出：${task.output_dir}`;
@@ -209,6 +210,18 @@ function renderTask() {
   $("progressPercent").textContent = `${percent}%`;
   $("progressStage").textContent = stageNames[task.current_stage] || task.current_stage;
   renderImageStrip(task.images || []);
+}
+
+function isImageEditable(image) {
+  return image?.status === "completed";
+}
+
+function syncActiveImageFromTask() {
+  if (!state.activeTask || !state.activeImage) return;
+  const latest = (state.activeTask.images || []).find((image) => image.id === state.activeImage.id);
+  if (latest) {
+    state.activeImage = { ...state.activeImage, ...latest };
+  }
 }
 
 function renderImageStrip(images) {
@@ -223,9 +236,10 @@ function renderImageStrip(images) {
   images.forEach((image) => {
     const button = document.createElement("button");
     button.className = `image-card ${state.activeImage?.id === image.id ? "active" : ""}`;
+    const editable = isImageEditable(image);
     button.innerHTML = `<strong>${escapeHtml(image.relative_path)}</strong>
-      <small>${image.status === "completed" ? "可校正" : `${stageNames[image.stage] || image.stage} ${Math.round(image.progress * 100)}%`}</small>`;
-    button.disabled = image.status !== "completed";
+      <small>${editable ? "可校正" : `${stageNames[image.stage] || image.stage} ${Math.round(image.progress * 100)}%`}</small>`;
+    button.disabled = !editable;
     button.onclick = () => openImage(image);
     strip.append(button);
   });
@@ -334,6 +348,10 @@ function setEditorMode(mode) {
 }
 
 async function openImage(image) {
+  if (!isImageEditable(image)) {
+    $("editorMessage").textContent = "这张图片还在处理中，完成后即可校正";
+    return;
+  }
   state.activeImage = image;
   state.activeRegion = null;
   state.dirtyOcrIndices.clear();
@@ -504,6 +522,10 @@ function syncActiveRegion() {
 
 function addRegion() {
   if (!state.activeImage || !$("resultImage").naturalWidth) return;
+  if (!isImageEditable(state.activeImage)) {
+    $("editorMessage").textContent = "这张图片还在处理中，完成后即可新增 OCR 框";
+    return;
+  }
   syncActiveRegion();
   state.editorMode = "ocr";
   const { width, height } = imagePixelSize();
@@ -543,6 +565,10 @@ function toggleRegion() {
 
 async function reprocessRegions() {
   if (!state.activeImage) return;
+  if (!isImageEditable(state.activeImage)) {
+    $("editorMessage").textContent = "这张图片还在处理中，完成后即可重新识别";
+    return;
+  }
   syncActiveRegion();
   const changed = [...state.dirtyOcrIndices].filter((index) => state.regions[index]);
   if (!changed.length) {
@@ -559,6 +585,13 @@ async function reprocessRegions() {
       body: JSON.stringify({ regions: state.regions, changed_indices: changed }),
     });
     state.regions = data.regions.map(ensureRegionShape);
+    state.activeImage = {
+      ...state.activeImage,
+      status: "completed",
+      stage: "saved",
+      progress: 1,
+      result_url: data.result_url || state.activeImage.result_url,
+    };
     state.dirtyOcrIndices.clear();
     if (state.activeRegion !== null && state.activeRegion >= state.regions.length) {
       state.activeRegion = state.regions.length ? state.regions.length - 1 : null;
@@ -582,6 +615,10 @@ async function reprocessRegions() {
 
 async function rerenderImage() {
   if (!state.activeImage) return;
+  if (!isImageEditable(state.activeImage)) {
+    $("editorMessage").textContent = "这张图片还在处理中，完成后即可重新嵌字";
+    return;
+  }
   syncActiveRegion();
   $("rerenderButton").disabled = true;
   $("editorMessage").textContent = "正在重新嵌字...";
@@ -592,6 +629,13 @@ async function rerenderImage() {
       body: JSON.stringify({ regions: state.regions }),
     });
     state.regions = data.regions.map(ensureRegionShape);
+    state.activeImage = {
+      ...state.activeImage,
+      status: "completed",
+      stage: "saved",
+      progress: 1,
+      result_url: data.result_url || state.activeImage.result_url,
+    };
     updateEditorPlaceholder();
     loadEditorImage();
     if (state.activeRegion !== null) {

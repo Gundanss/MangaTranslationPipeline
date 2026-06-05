@@ -18,7 +18,8 @@ class TaskManager:
         self.secrets = secrets
         self.queue: asyncio.Queue[str] = asyncio.Queue()
         self.worker_task: asyncio.Task | None = None
-        self.processing_lock = asyncio.Lock()
+        self.model_lock = asyncio.Lock()
+        self.image_locks: dict[str, asyncio.Lock] = {}
 
     def start(self) -> None:
         if not self.worker_task or self.worker_task.done():
@@ -53,12 +54,18 @@ class TaskManager:
     async def enqueue(self, task_id: str) -> None:
         await self.queue.put(task_id)
 
+    def _image_lock(self, image_id: str) -> asyncio.Lock:
+        lock = self.image_locks.get(image_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self.image_locks[image_id] = lock
+        return lock
+
     async def _worker(self) -> None:
         while True:
             task_id = await self.queue.get()
             try:
-                async with self.processing_lock:
-                    await self._process_task(task_id)
+                await self._process_task(task_id)
             except Exception as exc:
                 self.database.update_task(
                     task_id, status="failed", current_stage="error", error=str(exc)
@@ -127,12 +134,14 @@ class TaskManager:
                 image_id=image_id,
             )
             try:
-                regions = await engine.process(
-                    Path(image["input_path"]),
-                    Path(image["output_path"]),
-                    Path(image["context_path"]),
-                    Path(image["regions_path"]),
-                )
+                async with self.model_lock:
+                    async with self._image_lock(image_id):
+                        regions = await engine.process(
+                            Path(image["input_path"]),
+                            Path(image["output_path"]),
+                            Path(image["context_path"]),
+                            Path(image["regions_path"]),
+                        )
                 self.database.update_image(
                     image_id, status="completed", stage="saved", progress=1.0
                 )
@@ -179,14 +188,15 @@ class TaskManager:
     async def rerender_image(
         self, image: dict[str, Any], updates: list[dict[str, Any]]
     ) -> list[dict[str, Any]]:
-        async with self.processing_lock:
-            return await rerender(
-                Path(image["context_path"]),
-                Path(image["regions_path"]),
-                Path(image["output_path"]),
-                Path(image["input_path"]),
-                updates,
-            )
+        async with self.model_lock:
+            async with self._image_lock(image["id"]):
+                return await rerender(
+                    Path(image["context_path"]),
+                    Path(image["regions_path"]),
+                    Path(image["output_path"]),
+                    Path(image["input_path"]),
+                    updates,
+                )
 
     async def reprocess_image(
         self,
@@ -218,17 +228,18 @@ class TaskManager:
                 details=details,
             )
 
-        async with self.processing_lock:
-            engine = self._build_engine(task["config"], progress, log)
-            regions = await engine.reprocess_regions(
-                Path(image["input_path"]),
-                Path(image["output_path"]),
-                Path(image["context_path"]),
-                Path(image["regions_path"]),
-                updates,
-                changed_indices,
-            )
-            self.database.update_image(
-                image["id"], status="completed", stage="saved", progress=1.0
-            )
-            return regions
+        async with self.model_lock:
+            async with self._image_lock(image["id"]):
+                engine = self._build_engine(task["config"], progress, log)
+                regions = await engine.reprocess_regions(
+                    Path(image["input_path"]),
+                    Path(image["output_path"]),
+                    Path(image["context_path"]),
+                    Path(image["regions_path"]),
+                    updates,
+                    changed_indices,
+                )
+                self.database.update_image(
+                    image["id"], status="completed", stage="saved", progress=1.0
+                )
+                return regions

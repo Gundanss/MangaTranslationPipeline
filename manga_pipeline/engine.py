@@ -4,6 +4,7 @@ import asyncio
 import gc
 import inspect
 import json
+import os
 import pickle
 import sys
 from pathlib import Path
@@ -177,7 +178,11 @@ def trim_runtime_memory(release_accelerator_cache: bool = True) -> None:
     try:
         import torch
 
-        if hasattr(torch, "mps") and hasattr(torch.mps, "empty_cache"):
+        if (
+            "PYTEST_CURRENT_TEST" not in os.environ
+            and hasattr(torch, "mps")
+            and hasattr(torch.mps, "empty_cache")
+        ):
             torch.mps.empty_cache()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -301,6 +306,53 @@ def _region_enabled(region: Any) -> bool:
     return bool(getattr(region, "enabled", True))
 
 
+def _config_section_value(
+    config: Any, section: str, name: str, fallback: str
+) -> str:
+    section_value = getattr(config, section, None)
+    return _enum_value(getattr(section_value, name, None), fallback)
+
+
+def _config_target_lang(config: Any) -> str:
+    target = _config_section_value(config, "translator", "target_lang", "CHS")
+    return target if target and target != "None" else "CHS"
+
+
+def _config_render_direction(config: Any) -> str:
+    return _config_section_value(config, "render", "direction", "auto")
+
+
+def _config_render_alignment(config: Any) -> str:
+    return _config_section_value(config, "render", "alignment", "auto")
+
+
+def _prepare_region_for_render(
+    region: Any,
+    config: Any,
+    direction: str | None = None,
+    alignment: str | None = None,
+) -> None:
+    region.target_lang = _config_target_lang(config)
+    selected_direction = (
+        direction
+        if direction is not None
+        else _enum_value(
+            getattr(region, "_direction", _config_render_direction(config))
+        )
+    )
+    region._direction = _core_direction(
+        selected_direction or _config_render_direction(config)
+    )
+    region._alignment = (
+        alignment
+        if alignment is not None
+        else _enum_value(
+            getattr(region, "_alignment", _config_render_alignment(config))
+        )
+    )
+    region.adjust_bg_color = False
+
+
 def _make_text_region(
     core: dict[str, Any],
     bbox: list[int],
@@ -339,11 +391,14 @@ def _make_mask_from_regions(
 
 def _ensure_payload_region_boxes(payload: dict[str, Any]) -> dict[str, Any]:
     width, height = _image_size_from_payload(payload)
+    config = payload.get("config")
     for region in payload.get("text_regions", []) or []:
         xyxy = _clip_bbox(_region_bbox(region), width, height)
         ocr_bbox = _clip_bbox(getattr(region, "ocr_bbox", xyxy), width, height)
         render_bbox = _clip_bbox(getattr(region, "render_bbox", xyxy), width, height)
         _update_bbox_fields(region, ocr_bbox, render_bbox)
+        if config is not None:
+            _prepare_region_for_render(region, config)
     return payload
 
 
@@ -590,6 +645,130 @@ class CoreEngine:
             force_simple_sort=False,
         )
 
+    def _join_manual_ocr_texts(self, texts: list[str]) -> str:
+        cleaned = [text.strip() for text in texts if text and text.strip()]
+        if self.source_language == "ja":
+            return "".join(cleaned)
+        return " ".join(cleaned)
+
+    def _offset_textline(self, core: dict[str, Any], textline: Any, x: int, y: int) -> Any:
+        if not hasattr(textline, "pts"):
+            return textline
+        offset = np.array([x, y], dtype=np.int32)
+        points = np.asarray(textline.pts, dtype=np.int32) + offset
+        text = getattr(textline, "text", "")
+        prob = getattr(textline, "prob", 1)
+        foreground = [
+            int(value) for value in getattr(textline, "fg_colors", (0, 0, 0))[:3]
+        ]
+        background = [
+            int(value)
+            for value in getattr(textline, "bg_colors", (255, 255, 255))[:3]
+        ]
+        try:
+            return core["Quadrilateral"](
+                points,
+                text,
+                prob,
+                *foreground,
+                *background,
+            )
+        except TypeError:
+            return core["Quadrilateral"](points, text, prob)
+
+    async def _ocr_user_bbox(
+        self,
+        core: dict[str, Any],
+        translator: Any,
+        config: Any,
+        image: np.ndarray,
+        bbox: list[int],
+    ) -> tuple[str, tuple[Any, Any] | None]:
+        x1, y1, x2, y2 = bbox
+        crop = np.ascontiguousarray(image[y1:y2, x1:x2])
+        crop_height, crop_width = crop.shape[:2]
+        crop_ctx = SimpleNamespace(
+            img_rgb=crop,
+            textlines=[],
+            mask_raw=None,
+            mask=None,
+        )
+        detected_textlines: list[Any] = []
+        try:
+            detected_textlines, _, _ = await translator._run_detection(config, crop_ctx)
+        except Exception as exc:
+            await self.log_callback(
+                "WARNING",
+                "ocr",
+                f"框内文字检测失败，改用单框 OCR：{exc}",
+                None,
+            )
+        detected_textlines = detected_textlines or []
+
+        crop_ctx.textlines = detected_textlines
+        ocr_textlines = await translator._run_ocr(config, crop_ctx) if detected_textlines else []
+        if not ocr_textlines:
+            crop_ctx.textlines = [
+                core["Quadrilateral"](
+                    _bbox_to_polygon([0, 0, crop_width, crop_height]),
+                    "",
+                    1,
+                )
+            ]
+            ocr_textlines = await translator._run_ocr(config, crop_ctx)
+
+        ocr_textlines = [line for line in ocr_textlines if getattr(line, "text", "").strip()]
+        if not ocr_textlines:
+            return "", None
+
+        global_textlines = [
+            self._offset_textline(core, line, x1, y1) for line in ocr_textlines
+        ]
+        merge_textlines = [line for line in global_textlines if hasattr(line, "pts")]
+        if not merge_textlines:
+            color_source = ocr_textlines[0]
+            return (
+                self._join_manual_ocr_texts(
+                    [getattr(line, "text", "") for line in ocr_textlines]
+                ),
+                (
+                    getattr(color_source, "fg_colors", (0, 0, 0)),
+                    getattr(color_source, "bg_colors", (255, 255, 255)),
+                ),
+            )
+
+        merge_ctx = SimpleNamespace(textlines=merge_textlines, img_rgb=image)
+        try:
+            merged_regions = await translator._run_textline_merge(config, merge_ctx)
+        except Exception as exc:
+            await self.log_callback(
+                "WARNING",
+                "textline_merge",
+                f"框内文字合并失败，使用 OCR 行顺序：{exc}",
+                None,
+            )
+            merged_regions = []
+
+        if merged_regions:
+            color_source = merged_regions[0]
+            return (
+                self._join_manual_ocr_texts(
+                    [getattr(region, "text", "") for region in merged_regions]
+                ),
+                color_source.get_font_colors(),
+            )
+
+        color_source = merge_textlines[0]
+        return (
+            self._join_manual_ocr_texts(
+                [getattr(line, "text", "") for line in merge_textlines]
+            ),
+            (
+                getattr(color_source, "fg_colors", (0, 0, 0)),
+                getattr(color_source, "bg_colors", (255, 255, 255)),
+            ),
+        )
+
     async def _translate_manual_texts(self, texts: list[str]) -> list[str]:
         if not texts:
             return []
@@ -766,6 +945,7 @@ class CoreEngine:
         use_gpu: bool,
     ) -> list[dict[str, Any]]:
         core, translator = self._build(use_gpu)
+        config = self._config(core, use_gpu)
         with context_path.open("rb") as file:
             payload = _normalize_rerender_payload(pickle.load(file))
         width, height = _image_size_from_payload(payload)
@@ -777,7 +957,6 @@ class CoreEngine:
 
         all_regions: list[Any] = []
         reocr_slots: list[int] = []
-        reocr_quads: list[Any] = []
         for update in updates:
             old_region = (
                 existing_regions[update["index"]]
@@ -808,24 +987,21 @@ class CoreEngine:
                     _hex_rgb(update["foreground"]),
                     _hex_rgb(update["outline"]),
                 )
-                region.adjust_bg_color = False
+            _prepare_region_for_render(
+                region,
+                config,
+                update["direction"],
+                update["alignment"],
+            )
             region.enabled = update["enabled"]
             _update_bbox_fields(region, update["ocr_bbox"], update["render_bbox"])
             _set_region_geometry(region, update["ocr_bbox"])
             all_regions.append(region)
             if update["enabled"] and update["index"] in changed:
                 reocr_slots.append(update["index"])
-                reocr_quads.append(
-                    core["Quadrilateral"](
-                        _bbox_to_polygon(update["ocr_bbox"]),
-                        "",
-                        1,
-                    )
-                )
 
-        config = self._config(core, use_gpu)
         ctx = SimpleNamespace(
-            textlines=reocr_quads,
+            textlines=[],
             text_regions=[],
             img_rgb=payload["img_rgb"],
             img_inpainted=None,
@@ -834,30 +1010,34 @@ class CoreEngine:
             mask=None,
             render_mask=None,
         )
-        if reocr_quads:
+        if reocr_slots:
             await self.log_callback(
                 "INFO",
                 "ocr",
-                f"正在重新识别 {len(reocr_quads)} 个人工 OCR 框",
+                f"正在重新识别 {len(reocr_slots)} 个人工 OCR 框",
                 None,
             )
             texts_to_translate: list[str] = []
             translated_slots: list[int] = []
-            for slot, quad in zip(reocr_slots, reocr_quads):
-                ctx.textlines = [quad]
-                ocr_textlines = await translator._run_ocr(config, ctx)
+            for slot in reocr_slots:
                 region = all_regions[slot]
-                if not ocr_textlines:
+                text, colors = await self._ocr_user_bbox(
+                    core,
+                    translator,
+                    config,
+                    payload["img_rgb"],
+                    getattr(region, "ocr_bbox", _region_bbox(region)),
+                )
+                if not text:
                     region.text = ""
                     region.translation = ""
                     continue
-                textline = ocr_textlines[0]
-                region.text = textline.text
-                region.text_raw = textline.text
-                region.prob = getattr(textline, "prob", 1)
-                region.set_font_colors(textline.fg_colors, textline.bg_colors)
-                if textline.text.strip():
-                    texts_to_translate.append(textline.text)
+                region.text = text
+                region.text_raw = text
+                if colors is not None:
+                    region.set_font_colors(colors[0], colors[1])
+                if text.strip():
+                    texts_to_translate.append(text)
                     translated_slots.append(slot)
             translations = await self._translate_manual_texts(texts_to_translate)
             for slot, translation in zip(translated_slots, translations):
@@ -871,6 +1051,7 @@ class CoreEngine:
 
         enabled_regions = [region for region in all_regions if _region_enabled(region)]
         for region in enabled_regions:
+            _prepare_region_for_render(region, config)
             _set_region_geometry(region, getattr(region, "ocr_bbox", _region_bbox(region)))
         ctx.text_regions = enabled_regions
         if enabled_regions:
@@ -881,7 +1062,7 @@ class CoreEngine:
                 _set_region_geometry(
                     region, getattr(region, "render_bbox", _region_bbox(region))
                 )
-                region.adjust_bg_color = False
+                _prepare_region_for_render(region, config)
             ctx.text_regions = enabled_regions
             rendered = await translator._run_text_rendering(config, ctx)
         else:
@@ -933,8 +1114,6 @@ async def rerender(
         region.text = update["text"]
         region.translation = sanitize_translation_text(update["translation"])
         region.font_size = update["font_size"]
-        region._direction = _core_direction(update["direction"])
-        region._alignment = update["alignment"]
         region.set_font_colors(
             _hex_rgb(update["foreground"]),
             _hex_rgb(update["outline"]),
@@ -942,9 +1121,16 @@ async def rerender(
         region.enabled = update["enabled"]
         _update_bbox_fields(region, update["ocr_bbox"], update["render_bbox"])
         _set_region_geometry(region, update["render_bbox"])
-        region.adjust_bg_color = False
+        _prepare_region_for_render(
+            region,
+            config,
+            update["direction"],
+            update["alignment"],
+        )
 
     render_regions = [region for region in all_regions if _region_enabled(region)]
+    for region in render_regions:
+        _prepare_region_for_render(region, config)
     ctx = SimpleNamespace(
         text_regions=render_regions,
         img_rgb=payload["img_rgb"],
