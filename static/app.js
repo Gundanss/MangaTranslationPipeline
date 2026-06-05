@@ -14,6 +14,7 @@ const state = {
   editorMode: "ocr",
   dirtyOcrIndices: new Set(),
   dragState: null,
+  logsAutoFollow: true,
 };
 
 const stageNames = {
@@ -181,6 +182,7 @@ async function loadTasks() {
 
 function activateTask(taskId) {
   state.logs.clear();
+  state.logsAutoFollow = true;
   $("logWindow").innerHTML = "";
   if (state.eventSource) state.eventSource.close();
   state.eventSource = new EventSource(`/api/tasks/${taskId}/events`);
@@ -310,13 +312,25 @@ function loadEditorImage() {
   $("renderModeButton").classList.toggle("active", state.editorMode === "render");
 }
 
+function editorPlaceholder() {
+  return document.querySelector(".editor-placeholder");
+}
+
+function updateEditorPlaceholder() {
+  const placeholder = editorPlaceholder();
+  if (!placeholder) return;
+  placeholder.textContent = state.regions.length
+    ? "点击图片中的文本区域进行编辑"
+    : "这张图片没有可编辑文本区域";
+}
+
 function setEditorMode(mode) {
   syncActiveRegion();
   const active = state.activeRegion;
   state.activeRegion = null;
   state.editorMode = mode;
   loadEditorImage();
-  if (active !== null) selectRegion(active);
+  if (active !== null) selectRegion(active, { sync: false });
 }
 
 async function openImage(image) {
@@ -329,7 +343,8 @@ async function openImage(image) {
     $("openOriginal").href = image.original_url;
     $("canvasWrap").classList.add("ready");
     $("editorFields").classList.add("hidden");
-    document.querySelector(".editor-placeholder").classList.remove("hidden");
+    updateEditorPlaceholder();
+    editorPlaceholder().classList.remove("hidden");
     $("editorMessage").textContent = "";
     loadEditorImage();
     renderImageStrip(state.activeTask.images);
@@ -449,11 +464,11 @@ function syncBoxInputs() {
   setRegionBBox(region, [x, y, x + width, y + height]);
 }
 
-function selectRegion(index) {
-  syncActiveRegion();
+function populateRegionForm(index) {
   state.activeRegion = index;
   const region = state.regions[index];
-  document.querySelector(".editor-placeholder").classList.add("hidden");
+  if (!region) return;
+  editorPlaceholder().classList.add("hidden");
   $("editorFields").classList.remove("hidden");
   $("regionNumber").textContent = `区域 #${index + 1}`;
   $("regionText").value = region.text;
@@ -468,9 +483,15 @@ function selectRegion(index) {
   renderOverlays();
 }
 
+function selectRegion(index, options = {}) {
+  if (options.sync !== false) syncActiveRegion();
+  populateRegionForm(index);
+}
+
 function syncActiveRegion() {
   if (state.activeRegion === null) return;
   const region = state.regions[state.activeRegion];
+  if (!region) return;
   region.text = $("regionText").value;
   region.translation = $("regionTranslation").value;
   region.font_size = Number($("regionFontSize").value);
@@ -542,8 +563,14 @@ async function reprocessRegions() {
     if (state.activeRegion !== null && state.activeRegion >= state.regions.length) {
       state.activeRegion = state.regions.length ? state.regions.length - 1 : null;
     }
+    updateEditorPlaceholder();
     loadEditorImage();
-    if (state.activeRegion !== null) selectRegion(state.activeRegion);
+    if (state.activeRegion !== null) {
+      selectRegion(state.activeRegion, { sync: false });
+    } else {
+      $("editorFields").classList.add("hidden");
+      editorPlaceholder().classList.remove("hidden");
+    }
     $("editorMessage").textContent = "OCR 框重处理完成";
   } catch (error) {
     $("editorMessage").textContent = error.message;
@@ -565,8 +592,14 @@ async function rerenderImage() {
       body: JSON.stringify({ regions: state.regions }),
     });
     state.regions = data.regions.map(ensureRegionShape);
+    updateEditorPlaceholder();
     loadEditorImage();
-    if (state.activeRegion !== null) selectRegion(state.activeRegion);
+    if (state.activeRegion !== null) {
+      selectRegion(state.activeRegion, { sync: false });
+    } else {
+      $("editorFields").classList.add("hidden");
+      editorPlaceholder().classList.remove("hidden");
+    }
     $("editorMessage").textContent = "重新嵌字完成";
   } catch (error) {
     $("editorMessage").textContent = error.message;
@@ -578,7 +611,12 @@ async function rerenderImage() {
 function renderLogs() {
   const windowEl = $("logWindow");
   const logs = [...state.logs.values()].slice(-500);
-  if (!logs.length) return;
+  const wasNearBottom =
+    windowEl.scrollHeight - windowEl.scrollTop - windowEl.clientHeight <= 32;
+  if (!logs.length) {
+    windowEl.innerHTML = '<div class="empty-state">运行日志会显示在这里</div>';
+    return;
+  }
   windowEl.innerHTML = "";
   logs.forEach((log) => {
     const entry = document.createElement("div");
@@ -605,7 +643,10 @@ function renderLogs() {
     }
     windowEl.append(entry);
   });
-  windowEl.scrollTop = windowEl.scrollHeight;
+  if (state.logsAutoFollow || wasNearBottom) {
+    windowEl.scrollTop = windowEl.scrollHeight;
+    state.logsAutoFollow = true;
+  }
 }
 
 async function saveSettings() {
@@ -651,7 +692,11 @@ function bindEvents() {
   $("toggleRegionButton").onclick = toggleRegion;
   $("reprocessButton").onclick = reprocessRegions;
   $("rerenderButton").onclick = rerenderImage;
-  $("clearLogView").onclick = () => { state.logs.clear(); $("logWindow").innerHTML = '<div class="empty-state">日志显示已清空</div>'; };
+  $("clearLogView").onclick = () => {
+    state.logs.clear();
+    state.logsAutoFollow = true;
+    $("logWindow").innerHTML = '<div class="empty-state">日志显示已清空</div>';
+  };
   $("settingsButton").onclick = () => $("settingsDialog").showModal();
   $("saveSettings").onclick = saveSettings;
   ["regionX", "regionY", "regionW", "regionH"].forEach((id) => {
@@ -662,6 +707,11 @@ function bindEvents() {
   });
   window.addEventListener("resize", renderOverlays);
   $("canvasWrap").addEventListener("scroll", renderOverlays);
+  $("logWindow").addEventListener("scroll", (event) => {
+    const target = event.currentTarget;
+    state.logsAutoFollow =
+      target.scrollHeight - target.scrollTop - target.clientHeight <= 32;
+  });
   document.querySelectorAll(".tab").forEach((tab) => {
     tab.onclick = () => {
       document.querySelectorAll(".tab").forEach((item) => item.classList.toggle("active", item === tab));
@@ -673,6 +723,7 @@ function bindEvents() {
 
 async function init() {
   bindEvents();
+  updateEditorPlaceholder();
   updateProviderFields();
   await Promise.all([loadHealth(), loadSettings(), loadTasks()]);
   await loadModels();

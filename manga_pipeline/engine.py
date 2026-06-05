@@ -356,12 +356,30 @@ def _extract_clean_inpainted_image(ctx: Any) -> np.ndarray:
     return _copy_image_array(ctx.img_inpainted)
 
 
-def _build_rerender_payload(ctx: Any, config: Any) -> dict[str, Any]:
+def _build_minimal_rerender_payload(ctx: Any, config: Any) -> dict[str, Any]:
     payload = {
         "config": config,
-        "text_regions": ctx.text_regions,
+        "text_regions": list(getattr(ctx, "text_regions", []) or []),
         "img_rgb": _copy_image_array(ctx.img_rgb),
-        "img_inpainted": _extract_clean_inpainted_image(ctx),
+        "img_inpainted": _copy_image_array(ctx.img_rgb),
+        "img_alpha": getattr(ctx, "img_alpha", None),
+    }
+    return _ensure_payload_region_boxes(payload)
+
+
+def _build_rerender_payload(ctx: Any, config: Any) -> dict[str, Any]:
+    text_regions = list(getattr(ctx, "text_regions", []) or [])
+    if not text_regions:
+        return _build_minimal_rerender_payload(ctx, config)
+    try:
+        img_inpainted = _extract_clean_inpainted_image(ctx)
+    except RuntimeError:
+        return _build_minimal_rerender_payload(ctx, config)
+    payload = {
+        "config": config,
+        "text_regions": text_regions,
+        "img_rgb": _copy_image_array(ctx.img_rgb),
+        "img_inpainted": img_inpainted,
         "img_alpha": getattr(ctx, "img_alpha", None),
     }
     return _ensure_payload_region_boxes(payload)
@@ -370,13 +388,7 @@ def _build_rerender_payload(ctx: Any, config: Any) -> dict[str, Any]:
 def _normalize_rerender_payload(payload: dict[str, Any]) -> dict[str, Any]:
     if "ctx" in payload:
         legacy_ctx = payload["ctx"]
-        return _ensure_payload_region_boxes({
-            "config": payload["config"],
-            "text_regions": legacy_ctx.text_regions,
-            "img_rgb": _copy_image_array(legacy_ctx.img_rgb),
-            "img_inpainted": _extract_clean_inpainted_image(legacy_ctx),
-            "img_alpha": getattr(legacy_ctx, "img_alpha", None),
-        })
+        return _build_rerender_payload(legacy_ctx, payload["config"])
     required = {"config", "text_regions", "img_rgb", "img_inpainted"}
     missing = required - set(payload)
     if missing:

@@ -1,4 +1,5 @@
 import asyncio
+import json
 import pickle
 from types import SimpleNamespace
 
@@ -46,6 +47,25 @@ class FakeRegion:
 
     def get_font_colors(self):
         return self._fg, self._bg
+
+
+class DummyProvider:
+    def __init__(self, translations: dict[str, str] | None = None):
+        self.translations = translations or {}
+        self.log_callback = None
+
+    def set_log_callback(self, callback):
+        self.log_callback = callback
+
+    async def translate(self, texts, source, target):
+        return [self.translations.get(text, f"译文:{text}") for text in texts]
+
+
+class AttrDict(dict):
+    __getattr__ = dict.get
+
+    def __setattr__(self, key, value):
+        self[key] = value
 
 
 def test_direction_mapping_matches_upstream_text_blocks():
@@ -158,3 +178,174 @@ def test_rerender_uses_clean_background_and_latest_translation(tmp_path, monkeyp
         payload = pickle.load(file)
     assert "ctx" not in payload
     assert np.array_equal(payload["img_inpainted"], clean)
+
+
+def test_process_keeps_image_and_saves_empty_regions_when_no_text(
+    tmp_path, monkeypatch
+):
+    source = np.full((4, 4, 3), 180, dtype=np.uint8)
+    input_path = tmp_path / "input.png"
+    output_path = tmp_path / "output.png"
+    context_path = tmp_path / "context.pkl"
+    regions_path = tmp_path / "regions.json"
+    Image.fromarray(source).save(input_path)
+
+    class FakeTranslator:
+        def add_progress_hook(self, _hook):
+            return None
+
+        async def translate(self, image, config):
+            return AttrDict(
+                result=Image.fromarray(source.copy()),
+                text_regions=[],
+                img_rgb=source.copy(),
+                img_alpha=None,
+            )
+
+    monkeypatch.setattr(engine, "_mps_available", lambda: False)
+    monkeypatch.setattr(
+        engine.CoreEngine,
+        "_build",
+        lambda self, use_gpu: ({}, FakeTranslator()),
+    )
+    monkeypatch.setattr(
+        engine.CoreEngine,
+        "_config",
+        lambda self, core, use_gpu: SimpleNamespace(),
+    )
+
+    runner = engine.CoreEngine(
+        DummyProvider(),
+        "ja",
+        "zh-CN",
+        None,
+        "auto",
+        "auto",
+        None,
+        lambda *_args, **_kwargs: asyncio.sleep(0),
+        lambda *_args, **_kwargs: asyncio.sleep(0),
+    )
+
+    regions = asyncio.run(
+        runner.process(input_path, output_path, context_path, regions_path)
+    )
+
+    assert regions == []
+    assert np.array_equal(np.array(Image.open(output_path)), source)
+    assert json.loads(regions_path.read_text(encoding="utf-8")) == []
+    with context_path.open("rb") as file:
+        payload = pickle.load(file)
+    assert payload["text_regions"] == []
+    assert np.array_equal(payload["img_rgb"], source)
+    assert np.array_equal(payload["img_inpainted"], source)
+
+
+def test_reprocess_regions_returns_new_ocr_and_translation(tmp_path, monkeypatch):
+    clean = np.zeros((4, 4, 3), dtype=np.uint8)
+    input_path = tmp_path / "input.png"
+    output_path = tmp_path / "output.png"
+    context_path = tmp_path / "context.pkl"
+    regions_path = tmp_path / "regions.json"
+    Image.fromarray(clean).save(input_path)
+
+    region = FakeRegion("old text")
+    region.text = "old text"
+    region.ocr_bbox = [0, 0, 4, 4]
+    region.render_bbox = [0, 0, 4, 4]
+    region.enabled = True
+    with context_path.open("wb") as file:
+        pickle.dump(
+            {
+                "config": SimpleNamespace(),
+                "text_regions": [region],
+                "img_rgb": clean.copy(),
+                "img_inpainted": clean.copy(),
+                "img_alpha": None,
+            },
+            file,
+        )
+
+    class FakeQuadrilateral:
+        def __init__(self, polygon, text, prob):
+            self.polygon = polygon
+            self.text = text
+            self.prob = prob
+
+    class FakeTranslator:
+        def add_progress_hook(self, _hook):
+            return None
+
+        async def _run_ocr(self, config, ctx):
+            return [
+                SimpleNamespace(
+                    text="new ocr",
+                    prob=0.96,
+                    fg_colors=(10, 20, 30),
+                    bg_colors=(240, 240, 240),
+                )
+            ]
+
+        async def _run_mask_refinement(self, config, ctx):
+            return np.zeros((4, 4), dtype=np.uint8)
+
+        async def _run_inpainting(self, config, ctx):
+            return clean.copy()
+
+        async def _run_text_rendering(self, config, ctx):
+            assert ctx.text_regions[0].text == "new ocr"
+            assert ctx.text_regions[0].translation == "new translation"
+            return clean + 7
+
+    monkeypatch.setattr(engine, "_mps_available", lambda: False)
+    monkeypatch.setattr(
+        engine.CoreEngine,
+        "_build",
+        lambda self, use_gpu: (
+            {
+                "Quadrilateral": FakeQuadrilateral,
+                "dump_image": lambda base_image, rendered, alpha: Image.fromarray(
+                    rendered
+                ),
+            },
+            FakeTranslator(),
+        ),
+    )
+    monkeypatch.setattr(
+        engine.CoreEngine,
+        "_config",
+        lambda self, core, use_gpu: SimpleNamespace(),
+    )
+
+    runner = engine.CoreEngine(
+        DummyProvider({"new ocr": "new translation"}),
+        "ja",
+        "zh-CN",
+        None,
+        "auto",
+        "auto",
+        None,
+        lambda *_args, **_kwargs: asyncio.sleep(0),
+        lambda *_args, **_kwargs: asyncio.sleep(0),
+    )
+
+    updates = serialize_regions([region])
+    updates[0]["translation"] = "stale translation"
+
+    regions = asyncio.run(
+        runner.reprocess_regions(
+            input_path,
+            output_path,
+            context_path,
+            regions_path,
+            updates,
+            [0],
+        )
+    )
+
+    assert regions[0]["text"] == "new ocr"
+    assert regions[0]["translation"] == "new translation"
+    assert np.array_equal(np.array(Image.open(output_path)), clean + 7)
+    with context_path.open("rb") as file:
+        payload = pickle.load(file)
+    assert payload["text_regions"][0].text == "new ocr"
+    assert payload["text_regions"][0].translation == "new translation"
