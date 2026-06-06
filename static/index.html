@@ -163,8 +163,15 @@
             <div class="editor-layout">
               <div class="canvas-column">
                 <div class="compare-labels">
-                  <span>翻译结果</span>
+                  <span id="canvasModeLabel">翻译结果</span>
                   <a id="openOriginal" href="#" target="_blank">查看原图</a>
+                </div>
+                <div class="box-toolbar">
+                  <div class="segmented" role="group" aria-label="编辑模式">
+                    <button id="ocrModeButton" class="active" type="button">OCR框</button>
+                    <button id="renderModeButton" type="button">译文框</button>
+                  </div>
+                  <button id="addRegionButton" class="text-button" type="button">新增 OCR 框</button>
                 </div>
                 <div id="canvasWrap" class="canvas-wrap empty-state">
                   <span>任务完成后，点击图片进入校正</span>
@@ -178,6 +185,24 @@
                   <div class="region-title">
                     <span id="regionNumber">区域 #1</span>
                     <span id="regionBox" class="muted"></span>
+                  </div>
+                  <div class="grid-four">
+                    <label class="field">
+                      <span>X</span>
+                      <input id="regionX" type="number" min="0" />
+                    </label>
+                    <label class="field">
+                      <span>Y</span>
+                      <input id="regionY" type="number" min="0" />
+                    </label>
+                    <label class="field">
+                      <span>宽</span>
+                      <input id="regionW" type="number" min="2" />
+                    </label>
+                    <label class="field">
+                      <span>高</span>
+                      <input id="regionH" type="number" min="2" />
+                    </label>
                   </div>
                   <label class="field">
                     <span>OCR 原文</span>
@@ -216,6 +241,8 @@
                       <label><span>描边</span><input id="regionOutline" type="color" /></label>
                     </div>
                   </div>
+                  <button id="toggleRegionButton" class="button secondary full" type="button">禁用区域</button>
+                  <button id="reprocessButton" class="button secondary full" type="button">重新识别并处理 OCR 框</button>
                   <button id="rerenderButton" class="button primary full">保存校正并重新嵌字</button>
                   <p id="editorMessage" class="form-message"></p>
                 </div>

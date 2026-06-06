@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Literal
+from typing import Annotated, Literal
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -9,6 +9,7 @@ TargetLanguage = Literal["zh-CN", "zh-TW", "en", "ja", "ko"]
 ProviderName = Literal["ollama", "google", "microsoft"]
 TextDirection = Literal["auto", "horizontal", "vertical"]
 TextAlignment = Literal["auto", "left", "center", "right"]
+BBox = Annotated[list[int], Field(min_length=4, max_length=4)]
 
 
 class TaskConfig(BaseModel):
@@ -42,6 +43,10 @@ class SettingsUpdate(BaseModel):
 
 class RegionUpdate(BaseModel):
     index: int = Field(ge=0)
+    bbox: BBox | None = None
+    ocr_bbox: BBox | None = None
+    render_bbox: BBox | None = None
+    enabled: bool = True
     text: str
     translation: str
     font_size: int = Field(ge=6, le=300)
@@ -53,3 +58,8 @@ class RegionUpdate(BaseModel):
 
 class RerenderRequest(BaseModel):
     regions: list[RegionUpdate]
+
+
+class ReprocessRegionsRequest(BaseModel):
+    regions: list[RegionUpdate]
+    changed_indices: list[int] = Field(default_factory=list)
