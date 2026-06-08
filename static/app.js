@@ -61,7 +61,9 @@ async function loadSettings() {
   $("ollamaBaseUrl").value = state.settings.ollama_base_url;
   $("microsoftRegion").value = state.settings.microsoft_region || "";
   $("microsoftEndpoint").value = state.settings.microsoft_endpoint || "";
-  $("googleState").textContent = state.settings.google_configured ? "已保存密钥" : "尚未配置";
+  $("googleState").textContent = state.settings.google_configured
+    ? "已保存可选官方密钥；不填也会走免费网页翻译"
+    : "默认使用免费网页翻译，无需密钥";
   $("microsoftState").textContent = state.settings.microsoft_configured ? "已保存密钥和区域" : "尚未完整配置";
 }
 

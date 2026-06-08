@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import html
+import json
 import re
 import uuid
 from abc import ABC, abstractmethod
@@ -18,6 +19,7 @@ TARGET_NAMES = {
     "ko": "韩语",
 }
 MICROSOFT_LANG = {"zh-CN": "zh-Hans", "zh-TW": "zh-Hant"}
+GOOGLE_WEB_ENDPOINT = "https://translate.googleapis.com/translate_a/single"
 
 
 class TranslationError(RuntimeError):
@@ -214,16 +216,30 @@ class OllamaProvider(TranslatorProvider):
 
 
 class GoogleProvider(TranslatorProvider):
-    def __init__(self, api_key: str):
-        if not api_key:
-            raise TranslationError("尚未配置 Google Cloud Translation API Key")
-        self.api_key = api_key
+    def __init__(self, api_key: str | None = None):
+        self.api_key = (api_key or "").strip()
 
-    async def translate(
+    def _parse_web_translation(self, payload: Any) -> str:
+        if not isinstance(payload, list) or not payload:
+            raise TranslationError("Google 网页翻译返回格式异常")
+        segments = payload[0]
+        if not isinstance(segments, list):
+            raise TranslationError("Google 网页翻译缺少文本片段")
+        parts: list[str] = []
+        for segment in segments:
+            if isinstance(segment, list) and segment and isinstance(segment[0], str):
+                parts.append(segment[0])
+        result = html.unescape("".join(parts)).strip()
+        if not result:
+            raise TranslationError("Google 网页翻译返回了空译文")
+        return result
+
+    async def _translate_official(
         self, texts: list[str], source: str, target: str
     ) -> list[str]:
         url = "https://translation.googleapis.com/language/translate/v2"
         payload = {"q": texts, "source": source, "target": target, "format": "text"}
+
         async def operation():
             async with httpx.AsyncClient(timeout=90) as client:
                 response = await client.post(
@@ -236,8 +252,46 @@ class GoogleProvider(TranslatorProvider):
                 raise TranslationError("Google 返回的翻译数量不一致")
             return results
 
+        return await self._run_with_retry("Google 翻译", operation)
+
+    async def _translate_web(
+        self, texts: list[str], source: str, target: str
+    ) -> list[str]:
+        async with httpx.AsyncClient(timeout=90) as client:
+            results: list[str] = []
+            for text in texts:
+                response = await client.get(
+                    GOOGLE_WEB_ENDPOINT,
+                    params={
+                        "client": "gtx",
+                        "sl": source,
+                        "tl": target,
+                        "dt": "t",
+                        "q": text,
+                    },
+                    headers={"User-Agent": "Mozilla/5.0"},
+                )
+                response.raise_for_status()
+                try:
+                    payload = response.json()
+                except json.JSONDecodeError as exc:
+                    raise TranslationError("Google 网页翻译返回了非 JSON 响应") from exc
+                results.append(self._parse_web_translation(payload))
+            if len(results) != len(texts):
+                raise TranslationError("Google 网页翻译返回的翻译数量不一致")
+            return results
+
+    async def translate(
+        self, texts: list[str], source: str, target: str
+    ) -> list[str]:
         try:
-            return await self._run_with_retry("Google 翻译", operation)
+            if self.api_key:
+                return await self._translate_official(texts, source, target)
+
+            async def operation():
+                return await self._translate_web(texts, source, target)
+
+            return await self._run_with_retry("Google 网页翻译", operation)
         except Exception as exc:
             raise TranslationError(f"Google 翻译失败：{exc}") from exc
 

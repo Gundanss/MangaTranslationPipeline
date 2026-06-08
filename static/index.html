@@ -58,7 +58,7 @@
             <span>翻译提供方</span>
             <select id="provider">
               <option value="ollama">Ollama 本地模型</option>
-              <option value="google">Google Cloud Translation</option>
+              <option value="google">Google 网页翻译（免费）</option>
               <option value="microsoft">Microsoft / Bing Translator</option>
             </select>
           </label>
@@ -277,8 +277,8 @@
           <input id="ollamaBaseUrl" value="http://localhost:11434" />
         </label>
         <label class="field">
-          <span>Google Cloud Translation API Key</span>
-          <input id="googleApiKey" type="password" placeholder="留空则保留现有密钥" />
+          <span>Google 可选官方 API Key</span>
+          <input id="googleApiKey" type="password" placeholder="默认使用免费网页翻译，留空即可" />
           <small id="googleState"></small>
         </label>
         <label class="field">
