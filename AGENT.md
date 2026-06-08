@@ -1,116 +1,116 @@
-# 漫画翻译流水线项目笔记
+# 漫画翻译流水线 AGENT 交接笔记
 
-## 1. 文档目的
+## 1. 这份文档是干什么的
 
-这份 `AGENT.md` 是我通读当前仓库后整理出的项目认知笔记，目标是帮助后续接手的人或智能代理快速理解：
+这份 `AGENT.md` 面向后续接手项目的人类开发者和智能体，目标不是重复 README，而是把当前仓库里已经落地的：
 
-- 这个项目现在是做什么的；
-- 主要代码分别在哪些文件里；
-- 一条图片翻译任务是怎么流转的；
-- 当前分支已经实现了哪些关键能力和边界行为；
-- 修改时哪些地方最容易踩坑。
+- 架构分层
+- 任务调用链
+- 数据落盘方式
+- 编辑器能力
+- 翻译提供方策略
+- 已修复过、不能回退的行为
 
-
-## 2. 项目定位
-
-这是一个面向 **macOS Apple Silicon** 的本地 Web 应用，项目名为 **漫画翻译流水线**。
-
-核心目标：
-
-- 输入日语或英语漫画/图像；
-- 识别图片中的文本；
-- 翻译为目标语言；
-- 自动去除原文并把译文重新嵌回图片；
-- 在网页中继续人工校正 OCR、译文、框位置和排版，直到结果满意。
-
-当前设计约束：
-
-- **每个任务只允许一种源语言**：`ja` 或 `en`；
-- 不支持同一任务里日英混合识别；
-- 支持单图和文件夹批量处理；
-- 批量结果保存到 `output/<时间戳-任务名>/`，并保留原始相对目录结构。
+系统地整理出来，方便继续开发、排查问题和交接。
 
 
-## 3. 技术栈与运行环境
+## 2. 项目当前定位
 
-### 3.1 后端
+**漫画翻译流水线** 是一个面向 **macOS Apple Silicon** 的本地 Web 应用。它把漫画或图像里的日语/英语文本识别出来，翻译成目标语言，自动去除原文并重嵌译文；然后允许用户在网页里继续人工修正 OCR、译文和文本框，直到结果满意。
 
-- Python `3.11`
-- FastAPI
-- SQLite
-- Pillow / OpenCV
-- httpx
+当前产品边界：
 
-### 3.2 前端
-
-- 原生 HTML / CSS / JavaScript
-- 无前端框架
-
-### 3.3 图像翻译核心
-
-固定复用 vendored 上游项目：
-
-- `vendor/manga-image-translator`
-- 锁定提交：`d5a3eee4a7b7b7754b71baa2ee82309dfff468bc`
-
-处理链路固定为：
-
-1. CTD 漫画文字检测
-2. 48px 多语言漫画 OCR
-3. 翻译（Ollama / Google / Microsoft）
-4. LaMa Large 去字
-5. 自动排版与嵌字
-
-### 3.4 许可证
-
-- 本项目：`GPL-3.0-only`
-- 上游核心和模型许可证需继续参考各自说明
+- 每个任务只允许一种源语言：`ja` 或 `en`
+- 不支持同一任务里混合日英 OCR/翻译
+- 支持单图和文件夹批量处理
+- 支持网页内二次编辑、重新 OCR、重新嵌字
+- 批量输出保留输入文件夹的相对目录结构
 
 
-## 4. 仓库结构总览
+## 3. 技术路线总览
 
-### 4.1 关键源码目录
+### 3.1 总体栈
 
-- `manga_pipeline/`
-  - 后端主逻辑
-- `static/`
-  - 前端页面、样式、交互脚本
-- `scripts/`
-  - 环境检查、模型下载脚本
-- `tests/`
+- 后端：Python 3.11 + FastAPI + SQLite + httpx + Pillow + OpenCV
+- 前端：原生 HTML / CSS / JavaScript
+- 图像核心：vendored `manga-image-translator`
+- 任务执行：单 worker 串行 + 模型锁 + 单图写锁
+
+### 3.2 固定图像处理链路
+
+项目固定复用 `vendor/manga-image-translator` 的图像流水线，核心路线是：
+
+```text
+CTD 漫画文字检测
+  -> 48px 多语言漫画 OCR
+  -> 翻译
+  -> LaMa Large 去字
+  -> 自动排版与嵌字
+```
+
+其中：
+
+- 日语任务默认按右到左阅读逻辑渲染
+- 英语任务默认按左到右阅读逻辑渲染
+- 中文目标语言默认关闭英文断词，优先适合气泡内排版
+
+### 3.3 模型与依赖下载策略
+
+首次安装脚本只会下载图像处理相关模型，不会下载任何 Ollama 模型。
+
+首次安装固定准备的模型：
+
+- `comictextdetector.pt.onnx`：CTD 检测
+- `ocr_ar_48px.ckpt` + `alphabet-all-v7.txt`：48px OCR
+- `lama_large_512px.ckpt`：LaMa 去字
+
+总图像模型下载量约 **504 MB**。Ollama 模型必须由用户自行安装，本项目只读取，不自动下载、删除或修改。
+
+
+## 4. 仓库结构和职责分层
+
+### 4.1 关键目录
+
+- `/Users/leijh/Documents/MangaTranslationPipeline/manga_pipeline`
+  - 后端业务逻辑
+- `/Users/leijh/Documents/MangaTranslationPipeline/static`
+  - 前端页面、样式和交互逻辑
+- `/Users/leijh/Documents/MangaTranslationPipeline/scripts`
+  - 安装与环境检查辅助脚本
+- `/Users/leijh/Documents/MangaTranslationPipeline/tests`
   - pytest 测试
-- `vendor/manga-image-translator/`
-  - vendored 图像翻译核心
+- `/Users/leijh/Documents/MangaTranslationPipeline/vendor/manga-image-translator`
+  - vendored 上游图像处理核心
 
 ### 4.2 关键运行目录
 
-- `uploads/`
-  - 用户上传图片的本地副本
-- `output/`
-  - 输出图片、区域 JSON、重嵌字上下文
-- `data/pipeline.db`
-  - SQLite 数据库
-- `models/`
-  - OCR / 检测 / 去字模型
-- `.local/settings.json`
-  - API 设置与上次选中的 Ollama 模型
+- `/Users/leijh/Documents/MangaTranslationPipeline/uploads`
+  - 上传文件副本
+- `/Users/leijh/Documents/MangaTranslationPipeline/output`
+  - 成品图与私有上下文
+- `/Users/leijh/Documents/MangaTranslationPipeline/data/pipeline.db`
+  - SQLite
+- `/Users/leijh/Documents/MangaTranslationPipeline/models`
+  - 图像模型
+- `/Users/leijh/Documents/MangaTranslationPipeline/.local/settings.json`
+  - 本地设置和 API key
 
 
-## 5. 关键文件职责
+## 5. 关键源码文件说明
 
-### 5.1 后端
+### 5.1 API 和入口层
 
-#### `manga_pipeline/main.py`
+#### `/Users/leijh/Documents/MangaTranslationPipeline/manga_pipeline/main.py`
 
-FastAPI 入口，负责：
+FastAPI 入口，职责：
 
 - 初始化 `Database`、`SecretStore`、`TaskManager`
-- 挂载 `static/`
-- 暴露 API 路由
-- 处理任务创建、任务查询、SSE 事件流、图片文件访问、区域读取、重新 OCR、重新嵌字等接口
+- 暴露 REST API 和 SSE
+- 处理文件上传、任务创建、图片读取、区域读取、重 OCR、重嵌字
 
-主要公开接口包括：
+核心接口：
 
+- `GET /`
 - `GET /api/health`
 - `GET /api/settings`
 - `PUT /api/settings`
@@ -119,288 +119,122 @@ FastAPI 入口，负责：
 - `GET /api/tasks`
 - `GET /api/tasks/{task_id}`
 - `GET /api/tasks/{task_id}/events`
+- `GET /api/images/{image_id}/file/{kind}`
 - `GET /api/images/{image_id}/regions`
 - `POST /api/images/{image_id}/rerender`
 - `POST /api/images/{image_id}/reprocess-regions`
 
-#### `manga_pipeline/tasks.py`
+这里还有一个很重要的兼容函数 `_normalize_region_json()`，会在读取旧区域 JSON 时补齐：
 
-任务调度器，负责：
-
-- 维护任务队列；
-- 启动单个后台 worker；
-- 按图片依次处理整个任务；
-- 调用 `CoreEngine` 完成单图处理；
-- 管理进度回调、日志记录和任务状态。
-
-当前并发模型很重要：
-
-- 整体仍是 **单 worker 串行任务**；
-- 重模型执行通过 `model_lock` 串行保护；
-- 同一张图片还会额外使用 `image_lock`，避免人工编辑与后台写同一图片时互相覆盖；
-- 这样做的结果是：
-  - 不会让多套模型同时冲击内存；
-  - 但已经完成的图片可以在批量任务继续跑后续页面时被人工编辑。
-
-#### `manga_pipeline/engine.py`
-
-这是项目最核心的文件，职责包括：
-
-- 包装并调用 `manga-image-translator`；
-- 构造检测、OCR、去字、渲染配置；
-- 处理 MPS / CPU 回退；
-- 序列化和反序列化区域数据；
-- 保存上下文，支持后续重新 OCR 和重新嵌字；
-- 为人工 OCR 框、人工译文框提供二次处理能力。
-
-当前这条分支上的关键行为：
-
-- **无文本图片不报错**，直接按成功处理，输出原图并保存空区域列表；
-- **重新嵌字** 时使用保存下来的干净底图，而不是在旧译文图片上继续叠字；
-- **人工 OCR 框重处理** 时，不再把大框硬当作单行文本：
-  - 会先按用户 `ocr_bbox` 裁剪原图；
-  - 在框内重新跑一次文字检测；
-  - 对检测到的子文字线做 OCR；
-  - 再按源语言阅读顺序合并回一个 UI 区域；
-  - 如果框内没检测到子文字线，再回退为单框 OCR；
-- 渲染前会补齐 `target_lang`、方向、对齐、颜色等字段，兼容历史上下文。
-
-#### `manga_pipeline/providers.py`
-
-翻译提供方抽象层，支持：
-
-- Ollama
-- Google Cloud Translation
-- Microsoft / Bing Translator
-
-这里有几个很关键的细节：
-
-- Ollama 采用带编号的 `<|1|>...` 格式做多区域翻译；
-- 如果模型批量返回格式不稳定，会自动回退为逐区域翻译；
-- 已对异常模型输出做清洗，能去掉类似：
-  - `<|1|>`
-  - `</|2|>`
-  - `<|/3|>`
-- 也会去掉 `译文:` / `translation:` 这类前缀；
-- 内置重试与重试日志。
-
-#### `manga_pipeline/db.py`
-
-SQLite 持久化层，负责：
-
-- 任务表 `tasks`
-- 图片表 `images`
-- 日志表 `logs`
-
-特点：
-
-- 使用 WAL；
-- 打开外键；
-- 写入使用线程锁串行化；
-- 日志是结构化的，支持 `details_json`。
-
-#### `manga_pipeline/secret_store.py`
-
-负责本地设置与密钥存储：
-
-- Ollama 地址
-- Google API Key
-- Microsoft API Key / Region / Endpoint
-- 上次使用的 Ollama 模型
-
-默认保存在 `.local/settings.json`，并设置权限为 `600`。
-
-#### `manga_pipeline/config.py`
-
-负责：
-
-- 根目录与运行目录定义；
-- 运行目录初始化；
-- 文件名清洗；
-- 相对路径安全校验；
-- 限制支持的图片扩展名：
-  - `.jpg`
-  - `.jpeg`
-  - `.png`
-  - `.webp`
-
-#### `manga_pipeline/schemas.py`
-
-Pydantic 模型定义，主要包括：
-
-- `TaskConfig`
-- `SettingsUpdate`
-- `RegionUpdate`
-- `RerenderRequest`
-- `ReprocessRegionsRequest`
-
-当前区域模型里很重要的字段：
-
-- `bbox`
 - `ocr_bbox`
 - `render_bbox`
 - `enabled`
-- `text`
-- `translation`
-- `font_size`
-- `direction`
-- `alignment`
-- `foreground`
-- `outline`
+- 清洗后的 `translation`
 
-### 5.2 前端
+### 5.2 调度层
 
-#### `static/index.html`
+#### `/Users/leijh/Documents/MangaTranslationPipeline/manga_pipeline/tasks.py`
 
-页面主结构，包含：
+`TaskManager` 是整个任务调度中枢。
 
-- 顶部状态栏与 API 设置按钮
-- 新建任务表单
-- 最近任务列表
-- 当前任务状态与进度条
-- 图片条带
-- “校正与重嵌”标签页
-- “运行日志”标签页
+它负责：
 
-#### `static/app.js`
+- 维护 `asyncio.Queue`
+- 启动单个后台 worker
+- 对任务里的图片逐张处理
+- 在人工编辑时复用同一套模型执行通道
 
-前端主控制器，负责：
+这里有两个非常重要的锁：
 
-- 初始化健康状态、设置、Ollama 模型列表；
-- 创建任务；
-- 通过 `EventSource` 订阅任务 SSE；
-- 维护任务、图片、区域、日志等前端状态；
-- 驱动 OCR 框 / 译文框 的拖拽、缩放、输入同步；
-- 发起“重新识别并处理 OCR 框”和“保存校正并重新嵌字”。
+- `model_lock`
+  - 保证重模型推理串行，避免内存爆炸
+- `image_locks[image_id]`
+  - 保证同一张图在“后台批量处理”和“人工重 OCR / 重嵌字”之间不会同时写上下文和输出文件
 
-当前前端状态管理里几个重要结论：
+当前调度策略不是“整本任务大锁”，而是：
 
-- 任务运行时，**已完成图片仍可点击进入编辑**；
-- 正在处理或尚未处理的图片保持只读；
-- SSE 刷新会更新当前图片状态，但会尽量避免把用户正在输入的内容覆盖掉；
-- 日志窗口有“自动跟随”逻辑：
-  - 用户停留在底部时自动滚动；
-  - 用户手动上滚后不强制拉回底部；
-  - 回到底部后恢复自动跟随。
+- 整个批量任务继续串行处理后续图片
+- 已完成图片允许插队进行人工编辑
+- 但人工操作会等待当前正在执行的模型操作结束，再进入模型执行区
 
-#### `static/styles.css`
+这套设计是为了在“可编辑性”和“内存控制”之间取平衡。
 
-原生样式文件，整体是暖色、卡片式界面，没有依赖外部 UI 框架。
+### 5.3 核心图像流水线
 
+#### `/Users/leijh/Documents/MangaTranslationPipeline/manga_pipeline/engine.py`
 
-## 6. 一条任务的完整流转
+这是最核心的文件，基本控制了：
 
-### 6.1 创建任务
+- 上游核心加载
+- 配置构建
+- OCR / 检测 / 去字 / 嵌字执行
+- 人工 OCR 框重处理
+- 重新嵌字
+- 上下文序列化
+- 运行内存回收
 
-1. 前端收集：
-   - 任务名
-   - 源语言
-   - 目标语言
-   - 翻译提供方
-   - Ollama 模型
-   - 可选润色模型
-   - 初始排版参数
-   - 图片文件和相对路径
-2. `POST /api/tasks`
-3. 后端校验配置：
-   - 提供方配置是否齐全
-   - Ollama 是否可连通
-   - 指定模型是否真实存在
-4. 图片复制到 `uploads/<task_id>/...`
-5. 输出目录创建为 `output/<时间戳-任务名>/...`
-6. 为每张图片预留：
-   - 输出路径
-   - 上下文 `context.pkl`
-   - 区域 JSON
-7. 数据写入 SQLite
-8. 任务入队
+关键点：
 
-### 6.2 后台处理单张图片
+#### 1. 核心导入与模型目录接管
 
-对每张图，后台会：
+`_import_core()` 会把 vendored core 注入 `sys.path`，并把上游 `ModelWrapper._MODEL_DIR` 指向本仓库的 `/models`。
 
-1. OCR / 检测 / 翻译 / 去字 / 嵌字
-2. 输出成品图
-3. 保存区域 JSON
-4. 保存私有上下文，用于后续重处理
-5. 记录结构化日志
-6. 更新任务和图片进度
+同时当前项目强制 CTD 走 CPU 映射，避免 ONNX 检测在这里走不稳定路径。
 
-### 6.3 人工编辑
+#### 2. MPS 到 CPU 回退
 
-当前已经支持两类人工操作：
+`process()` 和 `reprocess_regions()` 都是“两段式”：
 
-#### A. 重新嵌字
+- 先尝试 MPS
+- 如果异常文本包含 `mps` / `metal` / `bfloat16` / `not implemented` 等标记
+- 自动清缓存后改用 CPU 重跑
 
-用户可修改：
+#### 3. 手动 OCR 的策略
 
-- 译文
-- 字号
-- 方向
-- 对齐
-- 文字色
-- 描边色
-- 译文框位置与大小
+用户拖一个 OCR 框后，系统不会简单把整个框当成一条文字线硬识别。
 
-然后只重做“排版与嵌字”，不会重新跑 OCR。
+当前逻辑是：
 
-#### B. 重新识别并处理 OCR 框
+1. 按用户 `ocr_bbox` 从原图裁剪子图
+2. 在子图内重新跑文字检测
+3. 对检测出的子文字线做 OCR
+4. 再按源语言规则合并成一个区域文本
+5. 如果框内完全没检测到子文字线，再回退为“单框 OCR”
 
-用户可修改：
+这个行为是为了处理：
 
-- OCR 框位置
-- OCR 框大小
-- 新增 OCR 框
-- 禁用误识别区域
+- 多行文字
+- 多列竖排
+- 不规则排布
+- 大气泡内多个子文本块
 
-之后后台会重新：
+后续优化 OCR 时不要退化回“一个框永远只做一行 OCR”。
 
-1. 在该 OCR 框内检测文本；
-2. OCR；
-3. 翻译；
-4. 重新生成相关区域；
-5. 去字并重新嵌字。
+#### 4. 重新嵌字必须使用干净底图
 
+这是项目里一个非常重要、也修过 bug 的点。
 
-## 7. 当前编辑器能力
+当前实现会把“去字后但尚未嵌字”的干净底图作为重嵌字基底保存下来：
 
-在当前分支里，网页编辑器已经具备：
+- pickle 上下文：`<image_id>.pkl`
+- sidecar 干净图：`<image_id>.clean.png`
 
-- 查看翻译结果图；
-- 切换 `OCR框` / `译文框` 两种编辑模式；
-- 查看并调整单个区域的：
-  - 坐标
-  - OCR 原文
-  - 译文
-  - 字号
-  - 方向
-  - 对齐
-  - 文字色
-  - 描边色
-- 拖拽和缩放 OCR 框；
-- 拖拽和缩放译文框；
-- 新增 OCR 框；
-- 禁用 / 恢复某个区域；
-- 重新识别并处理 OCR 框；
-- 保存校正并重新嵌字。
+`rerender()` 会优先使用这张干净底图，而不是拿已经嵌过旧译文的结果图继续写字。否则就会出现文字叠字。
 
+如果老上下文没有 sidecar，但有足够的原始上下文，系统会尝试重新生成干净底图。
 
-## 8. 本地数据格式与持久化
+#### 5. 无文本图片视为成功
 
-### 8.1 SQLite
+当前实现已经修好：
 
-`data/pipeline.db` 中的核心实体：
+- 没有文字的图片不会报错
+- 任务不会因此失败
+- 直接输出原图
+- `regions` 返回空数组
 
-- `tasks`
-  - 任务级别状态、配置、进度
-- `images`
-  - 每张图片的输入、输出、上下文和状态
-- `logs`
-  - 结构化运行日志
+#### 6. 序列化与兼容
 
-### 8.2 区域 JSON
-
-区域 JSON 是前后端共享的重要结构。当前版本应优先保留这些字段：
+区域数据的统一出口是 `serialize_regions()`，它会输出：
 
 - `index`
 - `bbox`
@@ -415,98 +249,434 @@ Pydantic 模型定义，主要包括：
 - `foreground`
 - `outline`
 
-兼容逻辑已经做过：
+重处理和重嵌字都依赖这套字段，后续不要轻易改结构。
 
-- 老数据如果只有 `bbox`，会尽量补齐 `ocr_bbox` / `render_bbox`；
-- 翻译文本会在读取时做一次清洗。
+### 5.4 翻译提供方层
 
-### 8.3 私有上下文
+#### `/Users/leijh/Documents/MangaTranslationPipeline/manga_pipeline/providers.py`
 
-每张图会在输出目录下的 `.pipeline/` 中保存私有上下文，供后续：
+这是 OCR 后文本翻译的抽象层，当前支持三种逻辑入口：
 
-- 重新 OCR
-- 重新翻译
-- 重新去字
+- `ollama`
+- `google`
+- `microsoft`
+
+但 `google` 和 `microsoft` 都已经演化成“官方 API + 免费网页通道”双路径策略。
+
+#### 1. Ollama
+
+- 通过 `<|1|>...` 这种编号格式做多区域翻译
+- 如果模型不按格式返回，会自动回退为逐区域翻译
+- 支持对在线翻译结果再做一轮 Ollama 润色
+
+#### 2. Google
+
+- 如果配置了 `google_api_key`，走官方 Google Translation API
+- 如果没配 key，默认走免费网页接口：
+  - `https://translate.googleapis.com/translate_a/single`
+
+#### 3. Microsoft / Bing
+
+这里的 `provider="microsoft"` 当前有两条路径：
+
+- 配置了 `microsoft_api_key + microsoft_region`
+  - 走 Microsoft 官方 Translator API
+- 没有配置官方 key
+  - 自动走免费 Bing 网页翻译
+
+免费 Bing 路径的真实实现方式：
+
+1. 先打开 `https://cn.bing.com/translator`
+2. 跟随到最终页面
+3. 从页面源码里提取：
+   - `IG`
+   - `IID`
+   - `token`
+   - `key`
+   - TTL
+4. 使用接近浏览器真实 XHR 的请求头向 `/ttranslatev3` 发请求
+5. 会话参数按 TTL 缓存
+6. 失效或 400 时自动刷新页面会话后重试
+
+这里已经验证过真实请求可用，并实测翻译过：
+
+- `Hello world -> 你好，世界`
+- `最近アルバイトをしていると思ったら母親にプレゼントを買うためだったなんて…`
+
+需要注意：
+
+- 免费 Bing 走的是网页私有接口，不是官方公开 API
+- 它将来有被网页改版打断的风险
+- 这块如果出问题，优先先检查页面提取参数和请求头
+
+#### 4. 译文清洗
+
+`sanitize_translation_text()` 很关键，当前会清掉：
+
+- `<|1|>`
+- `</|2|>`
+- `<|/3|>`
+- `译文:`
+- `translation:`
+- 代码块包裹
+
+这是为了避免模型或网页翻译返回污染文本，后续不要轻易删掉。
+
+### 5.5 数据与设置层
+
+#### `/Users/leijh/Documents/MangaTranslationPipeline/manga_pipeline/db.py`
+
+SQLite 存储层，3 张核心表：
+
+- `tasks`
+- `images`
+- `logs`
+
+特点：
+
+- WAL 模式
+- 开启外键
+- 写入串行锁
+- 日志 `details_json` 为结构化 JSON
+
+#### `/Users/leijh/Documents/MangaTranslationPipeline/manga_pipeline/secret_store.py`
+
+本地设置存储层。
+
+保存内容包括：
+
+- `ollama_base_url`
+- `google_api_key`
+- `microsoft_api_key`
+- `microsoft_region`
+- `microsoft_endpoint`
+- `last_ollama_model`
+
+`public()` 只返回前端需要的公开字段，其中：
+
+- `google_configured`
+  - 表示是否填了官方 Google key
+- `microsoft_configured`
+  - 表示是否填了官方 Microsoft 配置
+  - **不表示 provider 是否可用**，因为未配置时也能走免费 Bing
+
+### 5.6 配置与 schema
+
+#### `/Users/leijh/Documents/MangaTranslationPipeline/manga_pipeline/config.py`
+
+负责：
+
+- 目录常量
+- 运行目录创建
+- 安全文件名清洗
+- 相对路径安全限制
+- 图片扩展名白名单
+
+当前支持的输入后缀：
+
+- `.jpg`
+- `.jpeg`
+- `.png`
+- `.webp`
+
+#### `/Users/leijh/Documents/MangaTranslationPipeline/manga_pipeline/schemas.py`
+
+Pydantic 模型定义，核心模型：
+
+- `TaskConfig`
+- `SettingsUpdate`
+- `RegionUpdate`
+- `RerenderRequest`
+- `ReprocessRegionsRequest`
+
+注意：
+
+- `provider` 仍固定是 `Literal["ollama", "google", "microsoft"]`
+- 没有新增 `bing-free` 这种枚举，历史兼容成本更低
+
+
+## 6. 前端架构与编辑器行为
+
+### 6.1 页面结构
+
+#### `/Users/leijh/Documents/MangaTranslationPipeline/static/index.html`
+
+页面由几块组成：
+
+- 新建任务表单
+- 任务历史
+- 当前任务状态卡片
+- 进度条
+- 图片条带
+- 编辑器 tab
+- 日志 tab
+- 设置弹窗
+
+翻译提供方文案当前应理解为：
+
+- `Ollama 本地模型`
+- `Google 网页翻译（免费）`
+- `Bing 网页翻译（免费） / Microsoft 官方 API`
+
+### 6.2 前端状态机
+
+#### `/Users/leijh/Documents/MangaTranslationPipeline/static/app.js`
+
+前端全局状态 `state` 包括：
+
+- 当前任务
+- 当前图片
+- 当前区域列表
+- 当前激活区域
+- OCR / 译文框编辑模式
+- 脏 OCR 区域索引集合
+- 拖拽状态
+- 日志自动跟随状态
+
+关键行为：
+
+#### 1. 任务 SSE
+
+前端通过 `EventSource(/api/tasks/{task_id}/events)` 拉：
+
+- 最新任务状态
+- 最新图片状态
+- 新增日志
+
+#### 2. 批量处理中仍可编辑已完成图片
+
+图片条带中：
+
+- `status === completed` 的图片可点击进入编辑
+- `running/queued/failed` 图片不进入可编辑态
+
+这是当前一个很重要的交互特性，不要回退成“任务 running 时整本都锁死”。
+
+#### 3. 两种编辑模式
+
+- `OCR框`
+  - 调整 OCR 框
+  - 新增 OCR 框
+  - 触发重新识别并处理 OCR 框
+- `译文框`
+  - 调整最终嵌字区域
+  - 只重做嵌字
+
+#### 4. 表单同步策略
+
+前端有意避免 SSE 或视图切换覆盖用户正在编辑的内容。
+如果后续继续改前端，最容易踩坑的就是：
+
+- 刷新图片状态时
+- 重选区域时
+- 切换 OCR/译文框模式时
+
+把旧值写回当前表单，导致用户改过的 OCR 或译文被覆盖。
+
+#### 5. 日志窗口滚动
+
+日志窗口当前有“智能自动跟随”：
+
+- 用户在底部时，新日志会跟随
+- 用户手动上滚后，不强制拉回底部
+- 回到底部后重新开启跟随
+
+
+## 7. 一条任务的完整调用链
+
+### 7.1 新建任务
+
+1. 前端收集任务参数和文件
+2. `POST /api/tasks`
+3. `main.py` 调用 `_validate_config()`
+4. `create_provider()` 校验 provider 可用性
+5. 上传文件写入 `uploads/<task_id>/...`
+6. 输出目录创建为 `output/<timestamp-task-name>/...`
+7. 每张图预生成：
+   - `output_path`
+   - `context_path`
+   - `regions_path`
+8. `Database.create_task()` 写 `tasks/images`
+9. `TaskManager.enqueue(task_id)`
+
+### 7.2 后台 worker 处理单张图
+
+`TaskManager._process_task()` 对每张图：
+
+1. 生成 `CoreEngine`
+2. 进入 `model_lock`
+3. 进入该图自己的 `image_lock`
+4. 调用 `CoreEngine.process()`
+5. `engine.py` 内调用上游 translator
+6. 输出成品图
+7. 输出区域 JSON
+8. 输出 pickle 上下文和干净底图 sidecar
+9. 更新 DB 中的 image/task 状态
+10. 写结构化日志
+
+### 7.3 编辑器打开图片
+
+1. 前端点击条带中的某张已完成图片
+2. `GET /api/images/{image_id}/regions`
+3. 后端读取区域 JSON，并做兼容补齐
+4. 前端显示图片、框、右侧表单
+
+### 7.4 人工“重新识别并处理 OCR 框”
+
+1. 前端提交 `POST /api/images/{image_id}/reprocess-regions`
+2. `TaskManager.reprocess_image()`
+3. 进入 `model_lock + image_lock`
+4. `CoreEngine.reprocess_regions()`
+5. 对变更框重新检测、OCR、翻译、去字、嵌字
+6. 更新：
+   - 输出图
+   - 区域 JSON
+   - 上下文
+7. 前端拿到最新 `regions`，刷新右侧 OCR 和译文
+
+### 7.5 人工“保存校正并重新嵌字”
+
+1. 前端提交 `POST /api/images/{image_id}/rerender`
+2. `TaskManager.rerender_image()`
+3. 进入 `model_lock + image_lock`
+4. `engine.rerender()`
+5. 使用干净底图 + 最新 `render_bbox/translation`
+6. 只重做排版与嵌字，不重跑 OCR
+7. 更新输出图、区域 JSON 和上下文
+
+
+## 8. 上下文、区域 JSON 和输出目录
+
+### 8.1 输出目录结构
+
+每个任务输出目录大致是：
+
+```text
+output/<时间戳-任务名>/
+  <与输入一致的相对路径图片>
+  .pipeline/
+    contexts/<image_id>.pkl
+    contexts/<image_id>.clean.png
+    regions/<image_id>.json
+```
+
+说明：
+
+- 成品图走用户原始相对路径
+- 私有上下文放在 `.pipeline/`
+- `.clean.png` 是重新嵌字必须依赖的干净底图
+
+### 8.2 区域 JSON 是前后端契约
+
+当前区域 JSON 是前后端共同依赖的数据契约。
+后续任何改动都必须优先兼容以下字段：
+
+- `index`
+- `bbox`
+- `ocr_bbox`
+- `render_bbox`
+- `enabled`
+- `text`
+- `translation`
+- `font_size`
+- `direction`
+- `alignment`
+- `foreground`
+- `outline`
+
+### 8.3 pickle 上下文的作用
+
+pickle 上下文不是临时缓存，而是重处理能力的基础设施。它支撑：
+
 - 重新嵌字
+- 人工 OCR 框重处理
+- 无需重新走整张图全流程
 
-这个上下文是编辑器可工作的关键依赖，不应随意改变结构。
+所以：
 
-
-## 9. 翻译与模型相关结论
-
-### 9.1 Ollama
-
-- 模型列表来自本机 `/api/tags`
-- 应用不会自动下载、删除或修改 Ollama 模型
-- 任务启动前会验证所选模型是否存在
-- 如果 Ollama 未启动或模型不存在，任务会在创建前直接报错
-
-### 9.2 在线翻译
-
-支持：
-
-- Google Cloud Translation
-- Microsoft / Bing Translator
-
-可选：
-
-- 使用 Ollama 对在线译文做二次润色
-
-### 9.3 首次安装下载的不是翻译模型
-
-首次安装下载的是图像处理模型，不包括 Ollama 模型，主要是：
-
-- CTD 检测模型
-- 48px OCR 模型与字典
-- LaMa Large 去字模型
+- 不要随便删字段
+- 不要轻易切换格式
+- 如果必须调整，优先加兼容读取逻辑
 
 
-## 10. 已知约束与容易踩坑的点
+## 9. 运行脚本与本地启动
 
-### 10.1 内存与并发
+### 9.1 首次安装脚本
 
-项目明显在有意识地控制内存：
+#### `/Users/leijh/Documents/MangaTranslationPipeline/首次安装.command`
 
-- 后台只有一个 worker；
-- 重模型执行受 `model_lock` 保护；
-- 任务处理中会周期性做内存清理；
-- 这是为了避免一次批量翻译时同时跑多套深度学习模型导致内存暴涨。
+职责：
 
-### 10.2 不能把新译文叠在旧译文图上
+1. 校验 Python 3.11
+2. 初始化 `vendor/manga-image-translator` 子模块
+3. 创建 `.venv`
+4. 安装主项目和上游依赖
+5. 运行 `scripts/download_models.py`
 
-重新嵌字必须基于保存的干净底图，否则会出现文字重叠。当前实现已经按这个方向修过，后续改动不要把它退化回去。
+特点：
 
-### 10.3 人工 OCR 不应简单假设“一个框就是一条文字线”
+- 失败时会保留已完成步骤
+- 会明确提示“不会下载任何 Ollama 模型”
 
-很多气泡里是多行、多列、竖排或不规则分布。当前更合理的做法是：
+### 9.2 启动脚本
 
-- 用户先给一个粗框；
-- 框内重新检测子文字线；
-- 再 OCR；
-- 最后按阅读顺序合并。
+#### `/Users/leijh/Documents/MangaTranslationPipeline/启动漫画翻译流水线.command`
 
-后续如果继续优化 OCR，应该沿着这个方向做，而不是回退成单框暴力识别。
+职责：
 
-### 10.4 无文本图片应视为成功
+- 检查 `.venv`
+- 设置 `PYTHONPATH`
+- 检查核心和模型是否齐全
+- 探测 Ollama 状态
+- 启动 uvicorn
+- 自动打开浏览器到 `http://127.0.0.1:8765`
 
-如果图片本来就没有可翻译文字：
 
-- 不应把任务标成失败；
-- 应直接输出原图；
-- 区域列表为空即可。
+## 10. 已知关键约束和不可回退行为
 
-### 10.5 前端不要把 SSE 刷新变成“覆盖用户输入”
+### 10.1 内存控制优先
 
-图片状态刷新和表单编辑是两条状态流。后续修改前端时，要特别注意：
+当前项目明确选择了“控制内存占用”优先于“并行吞吐最大化”：
 
-- 任务状态可以更新；
-- 当前选中图片的元数据可以更新；
-- 但不要把用户正在编辑的 OCR / 译文 / 坐标内容意外写回旧值。
+- 单 worker
+- 模型串行
+- 周期性 `trim_runtime_memory()`
+
+这是故意的，不是偶然写成的。
+
+### 10.2 不允许重新嵌字叠在旧译文上
+
+任何改动只要让重嵌字退回到“基于旧成品图再写字”，都属于回归 bug。
+
+### 10.3 无文本图片不能报错
+
+“没有可翻译文本”是正常场景，不应变成失败。
+
+### 10.4 人工框编辑要优先保留用户输入
+
+无论 SSE 刷新、重选区域还是模式切换，都不要把用户当前输入意外覆盖掉。
+
+### 10.5 provider 兼容优先
+
+现在 `provider="microsoft"` 已经同时承担：
+
+- 免费 Bing
+- 官方 Microsoft
+
+所以不要轻易改 provider 枚举，除非愿意处理：
+
+- 历史任务配置兼容
+- 前端下拉值兼容
+- 数据库里旧任务配置兼容
+
+### 10.6 路径和输出结构要稳定
+
+批量任务结果目录保留相对路径，这对用户找图和后续脚本都很重要。不要随便打乱输出结构。
 
 
 ## 11. 测试与常用命令
 
-### 11.1 启动开发服务
+### 11.1 开发启动
 
 ```bash
 source .venv/bin/activate
@@ -522,41 +692,37 @@ node --check static/app.js
 .venv/bin/python -m compileall -q manga_pipeline scripts
 zsh -n 首次安装.command
 zsh -n 启动漫画翻译流水线.command
+git diff --check
 ```
 
-### 11.3 现有测试覆盖重点
+### 11.3 当前测试重点
 
-测试已经覆盖到的重点包括：
+测试当前已覆盖这些重点：
 
 - 配置与路径安全
-- 数据库读写
-- 翻译响应清洗与编号解析
+- SQLite 读写
+- 译文清洗与编号解析
+- Google 免费翻译回退
+- Bing 免费翻译 bootstrap 和 provider 选择
 - 无文本图片成功处理
-- 重新嵌字使用干净底图
-- 区域序列化字段完整性
-- OCR 重处理后返回新 OCR / 新译文
-- 人工 OCR 框内多子文本检测与合并
-- 批量处理中已完成图片可插队人工编辑
+- 干净底图重嵌字
+- OCR 重处理返回最新 OCR / 译文
+- OCR 框内多子文本检测与合并
+- 批量处理中已完成图片插队人工编辑
 
 
-## 12. 对后续维护者的建议
+## 12. 后续维护建议
 
-如果后续继续开发，这几个原则值得保持：
+如果后续继续开发，优先遵守这些原则：
 
-1. **优先兼容已有上下文和区域 JSON**
-   - 因为重嵌字、重 OCR 都依赖它们。
-2. **不要破坏单源语言任务的假设**
-   - 前后端、提示词、阅读顺序都建立在这个约束上。
-3. **不要让前端状态刷新覆盖人工正在编辑的内容**
-   - 这是当前交互体验最敏感的点之一。
-4. **不要让人工操作重新拉起整套并发重模型**
-   - 现有锁模型是在效果和内存之间的折中。
-5. **对翻译文本的清洗逻辑要谨慎**
-   - 这里已经专门修过模型多余标签污染的问题。
-6. **输出目录和相对路径结构尽量保持稳定**
-   - 批量任务依赖它来维持页面与文件夹的一致性。
+1. 先兼容已有 `regions.json` 和 `context.pkl`
+2. 不破坏“单任务单源语言”假设
+3. 不让前端刷新覆盖正在编辑的内容
+4. 不让重模型并发失控导致内存飙升
+5. 不让重嵌字退化为叠字
+6. 对免费 Bing 这类网页私有接口保持警惕，改动时优先先做真实联机 smoke test
 
 
-## 13. 一句话总结
+## 13. 一句话理解这个项目
 
-这不是一个“纯 OCR 工具”，也不是一个“纯翻译工具”，而是一个围绕 **漫画图像翻译 + 去字嵌字 + 人工校正闭环** 搭起来的本地工作台。后续改动时，最好始终把这三个阶段当成一个整体来维护：**识别、翻译、重绘**。
+这不是单纯的 OCR 工具，也不是单纯的机翻工具。它本质上是一个围绕 **漫画图像识别 -> 翻译 -> 去字嵌字 -> 人工校正闭环** 组织起来的本地工作台。理解和维护它时，最好始终把这四段当作一个整体系统来看。
