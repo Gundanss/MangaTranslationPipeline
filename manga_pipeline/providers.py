@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass
 import html
 import json
 import re
+import time
 import uuid
 from abc import ABC, abstractmethod
 from typing import Any
@@ -20,6 +22,22 @@ TARGET_NAMES = {
 }
 MICROSOFT_LANG = {"zh-CN": "zh-Hans", "zh-TW": "zh-Hant"}
 GOOGLE_WEB_ENDPOINT = "https://translate.googleapis.com/translate_a/single"
+BING_TRANSLATOR_URL = "https://cn.bing.com/translator"
+BING_TRANSLATE_ENDPOINT = "https://cn.bing.com/ttranslatev3"
+BING_USER_AGENT = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/137.0.0.0 Safari/537.36"
+)
+_BING_BOOTSTRAP_HEADERS = {
+    "User-Agent": BING_USER_AGENT,
+    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+}
+_BING_IG_PATTERN = re.compile(r'IG:"([^"]+)"')
+_BING_IID_PATTERN = re.compile(r"fbpkgiid\.page\s*=\s*['\"]([^'\"]+)['\"]")
+_BING_TOKEN_PATTERN = re.compile(
+    r"params_AbusePreventionHelper\s*=\s*\[(\d+),\s*\"([^\"]+)\",\s*(\d+)\]"
+)
 
 
 class TranslationError(RuntimeError):
@@ -56,6 +74,19 @@ class TranslatorProvider(ABC):
         self, texts: list[str], source: str, target: str
     ) -> list[str]:
         raise NotImplementedError
+
+
+@dataclass
+class BingSession:
+    ig: str
+    iid: str
+    key: str
+    token: str
+    expires_at: float
+    cookie_header: str = ""
+    translator_url: str = BING_TRANSLATOR_URL
+    origin: str = "https://cn.bing.com"
+    translate_endpoint: str = BING_TRANSLATE_ENDPOINT
 
 
 def _tagged_prompt(texts: list[str]) -> str:
@@ -296,6 +327,169 @@ class GoogleProvider(TranslatorProvider):
             raise TranslationError(f"Google 翻译失败：{exc}") from exc
 
 
+class BingWebProvider(TranslatorProvider):
+    def __init__(self, translator_url: str = BING_TRANSLATOR_URL):
+        self.translator_url = translator_url.rstrip("/")
+        self.translate_endpoint = f"{self.translator_url.rsplit('/', 1)[0]}/ttranslatev3"
+        self._session: BingSession | None = None
+        self._request_counter = 0
+
+    def _map_lang(self, lang: str) -> str:
+        return MICROSOFT_LANG.get(lang, lang)
+
+    def _parse_bootstrap_html(
+        self,
+        content: str,
+        cookie_header: str = "",
+        translator_url: str = BING_TRANSLATOR_URL,
+        origin: str = "https://cn.bing.com",
+    ) -> BingSession:
+        ig_match = _BING_IG_PATTERN.search(content)
+        iid_match = _BING_IID_PATTERN.search(content)
+        token_match = _BING_TOKEN_PATTERN.search(content)
+        if not ig_match or not iid_match or not token_match:
+            raise TranslationError("免费 Bing 网页翻译页面结构已变化，无法提取鉴权参数")
+        ttl_ms = max(int(token_match.group(3)), 1000)
+        return BingSession(
+            ig=ig_match.group(1),
+            iid=iid_match.group(1),
+            key=token_match.group(1),
+            token=token_match.group(2),
+            expires_at=time.monotonic() + ttl_ms / 1000,
+            cookie_header=cookie_header,
+            translator_url=translator_url,
+            origin=origin,
+            translate_endpoint=f"{origin}/ttranslatev3",
+        )
+
+    def _cookie_header(self, client: httpx.AsyncClient) -> str:
+        return "; ".join(f"{key}={value}" for key, value in client.cookies.items())
+
+    def _is_session_valid(self, session: BingSession | None) -> bool:
+        return bool(session and session.expires_at - time.monotonic() > 5)
+
+    async def _bootstrap(self, client: httpx.AsyncClient) -> BingSession:
+        response = await client.get(self.translator_url, headers=_BING_BOOTSTRAP_HEADERS)
+        response.raise_for_status()
+        final_origin = f"{response.url.scheme}://{response.url.host}"
+        if response.url.port:
+            final_origin = f"{final_origin}:{response.url.port}"
+        session = self._parse_bootstrap_html(
+            response.text,
+            self._cookie_header(client),
+            str(response.url),
+            final_origin,
+        )
+        self._session = session
+        return session
+
+    async def _ensure_session(
+        self, client: httpx.AsyncClient, force_refresh: bool = False
+    ) -> BingSession:
+        if force_refresh or not self._is_session_valid(self._session):
+            return await self._bootstrap(client)
+        if self._session and self._session.cookie_header:
+            client.headers["Cookie"] = self._session.cookie_header
+        return self._session
+
+    def _translate_url(self, session: BingSession) -> str:
+        self._request_counter += 1
+        return (
+            f"{session.translate_endpoint}?isVertical=1&IG={session.ig}"
+            f"&IID={session.iid}&SFX={self._request_counter}"
+        )
+
+    def _parse_translation_payload(self, payload: Any) -> str:
+        items = payload if isinstance(payload, list) else [payload]
+        if not items or not isinstance(items[0], dict):
+            raise TranslationError("免费 Bing 网页翻译返回格式异常")
+        translations = items[0].get("translations")
+        if not isinstance(translations, list) or not translations:
+            raise TranslationError("免费 Bing 网页翻译缺少译文内容")
+        result = html.unescape(str(translations[0].get("text", ""))).strip()
+        if not result:
+            raise TranslationError("免费 Bing 网页翻译返回了空译文")
+        return result
+
+    async def _translate_one(
+        self,
+        client: httpx.AsyncClient,
+        text: str,
+        source: str,
+        target: str,
+    ) -> str:
+        for attempt in range(2):
+            session = await self._ensure_session(client, force_refresh=attempt > 0)
+            body = {
+                "fromLang": self._map_lang(source),
+                "to": self._map_lang(target),
+                "text": text,
+                "token": session.token,
+                "key": session.key,
+            }
+            headers = {
+                "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+                "Accept": "application/json, text/javascript, */*; q=0.01",
+                "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+                "Cache-Control": "no-cache",
+                "Origin": session.origin,
+                "Pragma": "no-cache",
+                "Priority": "u=1, i",
+                "Referer": session.translator_url,
+                "Sec-CH-UA": '"Google Chrome";v="137", "Chromium";v="137", "Not/A)Brand";v="24"',
+                "Sec-CH-UA-Mobile": "?0",
+                "Sec-CH-UA-Platform": '"macOS"',
+                "Sec-Fetch-Dest": "empty",
+                "Sec-Fetch-Mode": "cors",
+                "Sec-Fetch-Site": "same-origin",
+                "User-Agent": BING_USER_AGENT,
+                "X-Requested-With": "XMLHttpRequest",
+            }
+            if session.cookie_header:
+                headers["Cookie"] = session.cookie_header
+            response = await client.post(
+                self._translate_url(session),
+                data=body,
+                headers=headers,
+            )
+            try:
+                response.raise_for_status()
+            except httpx.HTTPStatusError as exc:
+                if response.status_code == 400 and attempt == 0:
+                    continue
+                raise TranslationError(f"免费 Bing 网页翻译请求失败：{exc}") from exc
+            try:
+                payload = response.json()
+            except json.JSONDecodeError as exc:
+                raise TranslationError("免费 Bing 网页翻译返回了非 JSON 响应") from exc
+            return self._parse_translation_payload(payload)
+        raise TranslationError("免费 Bing 网页翻译鉴权失效")
+
+    async def translate(
+        self, texts: list[str], source: str, target: str
+    ) -> list[str]:
+        if not texts:
+            return []
+
+        async def operation():
+            async with httpx.AsyncClient(
+                timeout=90,
+                follow_redirects=True,
+                headers=_BING_BOOTSTRAP_HEADERS,
+            ) as client:
+                results: list[str] = []
+                for text in texts:
+                    results.append(await self._translate_one(client, text, source, target))
+                if len(results) != len(texts):
+                    raise TranslationError("免费 Bing 网页翻译返回的翻译数量不一致")
+                return results
+
+        try:
+            return await self._run_with_retry("免费 Bing 网页翻译", operation)
+        except Exception as exc:
+            raise TranslationError(f"免费 Bing 网页翻译失败：{exc}") from exc
+
+
 class MicrosoftProvider(TranslatorProvider):
     def __init__(self, api_key: str, region: str, endpoint: str):
         if not api_key or not region:
@@ -366,9 +560,11 @@ def create_provider(name: str, settings: dict[str, str], ollama_model: str | Non
     if name == "google":
         return GoogleProvider(settings["google_api_key"])
     if name == "microsoft":
-        return MicrosoftProvider(
-            settings["microsoft_api_key"],
-            settings["microsoft_region"],
-            settings["microsoft_endpoint"],
-        )
+        if settings["microsoft_api_key"] and settings["microsoft_region"]:
+            return MicrosoftProvider(
+                settings["microsoft_api_key"],
+                settings["microsoft_region"],
+                settings["microsoft_endpoint"],
+            )
+        return BingWebProvider()
     raise TranslationError(f"未知翻译提供方：{name}")

@@ -64,7 +64,9 @@ async function loadSettings() {
   $("googleState").textContent = state.settings.google_configured
     ? "已保存可选官方密钥；不填也会走免费网页翻译"
     : "默认使用免费网页翻译，无需密钥";
-  $("microsoftState").textContent = state.settings.microsoft_configured ? "已保存密钥和区域" : "尚未完整配置";
+  $("microsoftState").textContent = state.settings.microsoft_configured
+    ? "已保存官方 Microsoft 配置；当前也可继续使用免费 Bing 网页翻译"
+    : "默认使用免费 Bing 网页翻译，无需密钥";
 }
 
 async function loadModels() {

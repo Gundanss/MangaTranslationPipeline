@@ -59,7 +59,7 @@
             <select id="provider">
               <option value="ollama">Ollama 本地模型</option>
               <option value="google">Google 网页翻译（免费）</option>
-              <option value="microsoft">Microsoft / Bing Translator</option>
+              <option value="microsoft">Bing 网页翻译（免费） / Microsoft 官方 API</option>
             </select>
           </label>
 
@@ -283,17 +283,17 @@
         </label>
         <label class="field">
           <span>Microsoft Translator API Key</span>
-          <input id="microsoftApiKey" type="password" placeholder="留空则保留现有密钥" />
+          <input id="microsoftApiKey" type="password" placeholder="可选：填写后改走 Microsoft 官方 API；留空默认免费 Bing" />
           <small id="microsoftState"></small>
         </label>
         <div class="grid-two">
           <label class="field">
-            <span>Microsoft 区域</span>
-            <input id="microsoftRegion" placeholder="例如 eastasia" />
+            <span>Microsoft 官方区域</span>
+            <input id="microsoftRegion" placeholder="仅官方 API 需要，例如 eastasia" />
           </label>
           <label class="field">
-            <span>Microsoft Endpoint</span>
-            <input id="microsoftEndpoint" />
+            <span>Microsoft 官方 Endpoint</span>
+            <input id="microsoftEndpoint" placeholder="仅官方 API 使用" />
           </label>
         </div>
         <div class="dialog-actions">

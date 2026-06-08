@@ -3,12 +3,15 @@ import asyncio
 import pytest
 
 from manga_pipeline.providers import (
+    BingWebProvider,
     GoogleProvider,
+    MicrosoftProvider,
     OllamaProvider,
     TranslationError,
     TranslatorProvider,
     _parse_single_response,
     _parse_tagged_response,
+    create_provider,
     sanitize_translation_text,
 )
 
@@ -85,6 +88,183 @@ def test_google_provider_works_without_api_key(monkeypatch):
     assert captured[0][1]["client"] == "gtx"
     assert captured[0][1]["sl"] == "en"
     assert captured[0][1]["tl"] == "zh-CN"
+
+
+def test_bing_bootstrap_parser_extracts_session_fields():
+    provider = BingWebProvider()
+    html_doc = """
+    <script>
+    var _G={IG:"ABC123XYZ"};
+    fbpkgiid.page = 'translator.5076';
+    var params_AbusePreventionHelper = [1780906451889,"token-value",3600000];
+    </script>
+    """
+
+    session = provider._parse_bootstrap_html(html_doc, "MUID=test-cookie")
+
+    assert session.ig == "ABC123XYZ"
+    assert session.iid == "translator.5076"
+    assert session.key == "1780906451889"
+    assert session.token == "token-value"
+    assert session.cookie_header == "MUID=test-cookie"
+    assert session.translate_endpoint == "https://cn.bing.com/ttranslatev3"
+    assert session.expires_at > 0
+
+
+def test_create_provider_uses_free_bing_without_official_credentials():
+    provider = create_provider(
+        "microsoft",
+        {
+            "ollama_base_url": "http://localhost:11434",
+            "google_api_key": "",
+            "microsoft_api_key": "",
+            "microsoft_region": "",
+            "microsoft_endpoint": "https://api.cognitive.microsofttranslator.com",
+        },
+        None,
+    )
+
+    assert isinstance(provider, BingWebProvider)
+
+
+def test_create_provider_uses_official_microsoft_with_credentials():
+    provider = create_provider(
+        "microsoft",
+        {
+            "ollama_base_url": "http://localhost:11434",
+            "google_api_key": "",
+            "microsoft_api_key": "secret",
+            "microsoft_region": "eastasia",
+            "microsoft_endpoint": "https://api.cognitive.microsofttranslator.com",
+        },
+        None,
+    )
+
+    assert isinstance(provider, MicrosoftProvider)
+
+
+def test_bing_provider_works_without_official_key(monkeypatch):
+    captured = {"get": [], "post": []}
+
+    class FakeResponse:
+        def __init__(self, *, text="", json_data=None, status_code=200, url="https://www.bing.com/translator?mkt=zh-CN"):
+            self.text = text
+            self._json_data = json_data
+            self.status_code = status_code
+            self.url = httpx.URL(url)
+
+        def raise_for_status(self):
+            if self.status_code >= 400:
+                request = httpx.Request("POST", "https://cn.bing.com/ttranslatev3")
+                raise httpx.HTTPStatusError("bad request", request=request, response=self)
+            return None
+
+        def json(self):
+            return self._json_data
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            self.headers = {}
+            self.cookies = {"MUID": "cookie-value"}
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def get(self, url, headers=None):
+            captured["get"].append((url, headers))
+            return FakeResponse(
+                text="""
+                <script>
+                var _G={IG:"ABC123XYZ"};
+                fbpkgiid.page = 'translator.5076';
+                var params_AbusePreventionHelper = [123456,"token-value",3600000];
+                </script>
+                """
+            )
+
+        async def post(self, url, data=None, headers=None):
+            captured["post"].append((url, data, headers))
+            return FakeResponse(
+                json_data=[{"translations": [{"text": "你好"}]}],
+            )
+
+    import httpx
+
+    monkeypatch.setattr("manga_pipeline.providers.httpx.AsyncClient", FakeClient)
+
+    provider = BingWebProvider()
+    result = asyncio.run(provider.translate(["hello"], "en", "zh-CN"))
+
+    assert result == ["你好"]
+    assert captured["get"][0][0] == "https://cn.bing.com/translator"
+    assert captured["post"][0][0].startswith("https://www.bing.com/ttranslatev3?isVertical=1&IG=ABC123XYZ")
+    assert captured["post"][0][1]["fromLang"] == "en"
+    assert captured["post"][0][1]["to"] == "zh-Hans"
+    assert captured["post"][0][1]["token"] == "token-value"
+    assert captured["post"][0][1]["key"] == "123456"
+
+
+def test_bing_provider_rebootstraps_after_400(monkeypatch):
+    calls = {"bootstrap": 0, "post": 0}
+
+    class FakeResponse:
+        def __init__(self, *, text="", json_data=None, status_code=200, url="https://www.bing.com/translator?mkt=zh-CN"):
+            self.text = text
+            self._json_data = json_data
+            self.status_code = status_code
+            self.url = httpx.URL(url)
+
+        def raise_for_status(self):
+            if self.status_code >= 400:
+                request = httpx.Request("POST", "https://cn.bing.com/ttranslatev3")
+                raise httpx.HTTPStatusError("bad request", request=request, response=self)
+            return None
+
+        def json(self):
+            return self._json_data
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            self.headers = {}
+            self.cookies = {"MUID": "cookie-value"}
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def get(self, url, headers=None):
+            calls["bootstrap"] += 1
+            return FakeResponse(
+                text=f"""
+                <script>
+                var _G={{IG:"ABC123XYZ{calls["bootstrap"]}"}};
+                fbpkgiid.page = 'translator.5076';
+                var params_AbusePreventionHelper = [123456,"token-{calls["bootstrap"]}",3600000];
+                </script>
+                """
+            )
+
+        async def post(self, url, data=None, headers=None):
+            calls["post"] += 1
+            if calls["post"] == 1:
+                return FakeResponse(status_code=400, json_data={"statusCode": 400})
+            return FakeResponse(json_data=[{"translations": [{"text": "你好"}]}])
+
+    import httpx
+
+    monkeypatch.setattr("manga_pipeline.providers.httpx.AsyncClient", FakeClient)
+
+    provider = BingWebProvider()
+    result = asyncio.run(provider.translate(["hello"], "en", "zh-CN"))
+
+    assert result == ["你好"]
+    assert calls["bootstrap"] == 2
+    assert calls["post"] == 2
 
 
 def test_ollama_falls_back_to_single_regions_when_batch_format_is_invalid():
