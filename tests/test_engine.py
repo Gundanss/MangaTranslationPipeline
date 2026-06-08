@@ -179,6 +179,76 @@ def test_rerender_uses_clean_background_and_latest_translation(tmp_path, monkeyp
         payload = pickle.load(file)
     assert "ctx" not in payload
     assert np.array_equal(payload["img_inpainted"], clean)
+    assert context_path.with_suffix(".clean.png").exists()
+
+
+def test_rerender_prefers_clean_sidecar_over_dirty_payload(tmp_path, monkeypatch):
+    clean = np.zeros((4, 4, 3), dtype=np.uint8)
+    dirty = np.full((4, 4, 3), 80, dtype=np.uint8)
+    input_path = tmp_path / "input.png"
+    output_path = tmp_path / "output.png"
+    context_path = tmp_path / "context.pkl"
+    regions_path = tmp_path / "regions.json"
+    Image.fromarray(clean).save(input_path)
+    Image.fromarray(clean).save(context_path.with_suffix(".clean.png"))
+
+    region = FakeRegion("old text")
+    region.ocr_bbox = [0, 0, 4, 4]
+    region.render_bbox = [0, 0, 4, 4]
+    with context_path.open("wb") as file:
+        pickle.dump(
+            {
+                "config": SimpleNamespace(),
+                "text_regions": [region],
+                "img_rgb": clean.copy(),
+                "img_inpainted": dirty.copy(),
+                "img_alpha": None,
+            },
+            file,
+        )
+
+    class FakeTranslator:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        async def _run_text_rendering(self, config, ctx):
+            assert np.array_equal(ctx.img_inpainted, clean)
+            return ctx.img_inpainted + 6
+
+    monkeypatch.setattr(
+        engine,
+        "_import_core",
+        lambda: {
+            "MangaTranslator": FakeTranslator,
+            "dump_image": lambda base_image, rendered, alpha: Image.fromarray(rendered),
+        },
+    )
+    monkeypatch.setattr(engine, "_font_path", lambda: "")
+
+    asyncio.run(
+        engine.rerender(
+            context_path,
+            regions_path,
+            output_path,
+            input_path,
+            [
+                {
+                    "index": 0,
+                    "ocr_bbox": [0, 0, 4, 4],
+                    "render_bbox": [0, 0, 4, 4],
+                    "text": "edited source",
+                    "translation": "new text",
+                    "font_size": 18,
+                    "direction": "auto",
+                    "alignment": "center",
+                    "foreground": "#000000",
+                    "outline": "#FFFFFF",
+                }
+            ],
+        )
+    )
+
+    assert np.array_equal(np.array(Image.open(output_path)), clean + 6)
 
 
 def test_process_keeps_image_and_saves_empty_regions_when_no_text(
@@ -295,7 +365,8 @@ def test_reprocess_regions_returns_new_ocr_and_translation(tmp_path, monkeypatch
         async def _run_text_rendering(self, config, ctx):
             assert ctx.text_regions[0].text == "new ocr"
             assert ctx.text_regions[0].translation == "new translation"
-            return clean + 7
+            ctx.img_inpainted[:] = clean + 7
+            return ctx.img_inpainted
 
     monkeypatch.setattr(engine, "_mps_available", lambda: False)
     monkeypatch.setattr(
@@ -350,6 +421,7 @@ def test_reprocess_regions_returns_new_ocr_and_translation(tmp_path, monkeypatch
         payload = pickle.load(file)
     assert payload["text_regions"][0].text == "new ocr"
     assert payload["text_regions"][0].translation == "new translation"
+    assert np.array_equal(payload["img_inpainted"], clean)
 
 
 def test_reprocess_manual_box_detects_and_merges_inner_textlines(

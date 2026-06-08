@@ -402,13 +402,62 @@ def _ensure_payload_region_boxes(payload: dict[str, Any]) -> dict[str, Any]:
     return payload
 
 
-def _extract_clean_inpainted_image(ctx: Any) -> np.ndarray:
+def _extract_gimp_clean_image(ctx: Any) -> np.ndarray | None:
     gimp_mask = getattr(ctx, "gimp_mask", None)
     if isinstance(gimp_mask, np.ndarray) and gimp_mask.ndim == 3 and gimp_mask.shape[2] >= 3:
         return np.ascontiguousarray(gimp_mask[..., :3][:, :, ::-1].copy())
+    return None
+
+
+def _extract_clean_inpainted_image(ctx: Any) -> np.ndarray:
+    gimp_clean = _extract_gimp_clean_image(ctx)
+    if gimp_clean is not None:
+        return gimp_clean
     if getattr(ctx, "img_inpainted", None) is None:
         raise RuntimeError("缺少可重新嵌字的去字底图")
     return _copy_image_array(ctx.img_inpainted)
+
+
+def _clean_sidecar_path(context_path: Path) -> Path:
+    return context_path.with_suffix(".clean.png")
+
+
+def _image_array_for_png(image: Any) -> np.ndarray | None:
+    array = _copy_image_array(image)
+    if array is None:
+        return None
+    if array.ndim == 2:
+        array = np.repeat(array[:, :, None], 3, axis=2)
+    if array.ndim != 3:
+        return None
+    if array.shape[2] > 3:
+        array = array[:, :, :3]
+    if array.dtype != np.uint8:
+        array = np.clip(array, 0, 255).astype(np.uint8)
+    return np.ascontiguousarray(array)
+
+
+def _save_clean_sidecar(context_path: Path, image: Any) -> None:
+    clean = _image_array_for_png(image)
+    if clean is None:
+        return
+    path = _clean_sidecar_path(context_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    Image.fromarray(clean).save(path)
+
+
+def _load_clean_sidecar(context_path: Path, expected_shape: tuple[int, ...]) -> np.ndarray | None:
+    path = _clean_sidecar_path(context_path)
+    if not path.exists():
+        return None
+    try:
+        with Image.open(path) as image:
+            clean = np.array(image.convert("RGB"))
+    except Exception:
+        return None
+    if clean.shape[:2] != expected_shape[:2]:
+        return None
+    return np.ascontiguousarray(clean)
 
 
 def _build_minimal_rerender_payload(ctx: Any, config: Any) -> dict[str, Any]:
@@ -418,6 +467,7 @@ def _build_minimal_rerender_payload(ctx: Any, config: Any) -> dict[str, Any]:
         "img_rgb": _copy_image_array(ctx.img_rgb),
         "img_inpainted": _copy_image_array(ctx.img_rgb),
         "img_alpha": getattr(ctx, "img_alpha", None),
+        "clean_image_trusted": True,
     }
     return _ensure_payload_region_boxes(payload)
 
@@ -426,9 +476,14 @@ def _build_rerender_payload(ctx: Any, config: Any) -> dict[str, Any]:
     text_regions = list(getattr(ctx, "text_regions", []) or [])
     if not text_regions:
         return _build_minimal_rerender_payload(ctx, config)
-    try:
-        img_inpainted = _extract_clean_inpainted_image(ctx)
-    except RuntimeError:
+    gimp_clean = _extract_gimp_clean_image(ctx)
+    if gimp_clean is not None:
+        img_inpainted = gimp_clean
+        clean_image_trusted = True
+    elif getattr(ctx, "img_inpainted", None) is not None:
+        img_inpainted = _copy_image_array(ctx.img_inpainted)
+        clean_image_trusted = False
+    else:
         return _build_minimal_rerender_payload(ctx, config)
     payload = {
         "config": config,
@@ -436,25 +491,84 @@ def _build_rerender_payload(ctx: Any, config: Any) -> dict[str, Any]:
         "img_rgb": _copy_image_array(ctx.img_rgb),
         "img_inpainted": img_inpainted,
         "img_alpha": getattr(ctx, "img_alpha", None),
+        "clean_image_trusted": clean_image_trusted,
     }
     return _ensure_payload_region_boxes(payload)
 
 
-def _normalize_rerender_payload(payload: dict[str, Any]) -> dict[str, Any]:
+def _normalize_rerender_payload(
+    payload: dict[str, Any], context_path: Path | None = None
+) -> dict[str, Any]:
     if "ctx" in payload:
         legacy_ctx = payload["ctx"]
-        return _build_rerender_payload(legacy_ctx, payload["config"])
-    required = {"config", "text_regions", "img_rgb", "img_inpainted"}
-    missing = required - set(payload)
-    if missing:
-        raise RuntimeError(f"重新嵌字上下文缺少必要字段：{', '.join(sorted(missing))}")
-    return _ensure_payload_region_boxes(payload)
+        normalized = _build_rerender_payload(legacy_ctx, payload["config"])
+    else:
+        required = {"config", "text_regions", "img_rgb", "img_inpainted"}
+        missing = required - set(payload)
+        if missing:
+            raise RuntimeError(f"重新嵌字上下文缺少必要字段：{', '.join(sorted(missing))}")
+        normalized = _ensure_payload_region_boxes(payload)
+    if context_path is not None:
+        sidecar = _load_clean_sidecar(context_path, normalized["img_rgb"].shape)
+        if sidecar is not None:
+            normalized["img_inpainted"] = sidecar
+            normalized["clean_image_trusted"] = True
+    return normalized
 
 
 def _save_rerender_payload(context_path: Path, payload: dict[str, Any]) -> None:
     context_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = dict(payload)
+    clean = _image_array_for_png(payload.get("img_inpainted"))
+    if clean is not None:
+        payload["img_inpainted"] = clean
+        payload["clean_image_trusted"] = True
+        payload["clean_image_sidecar"] = _clean_sidecar_path(context_path).name
+        _save_clean_sidecar(context_path, clean)
     with context_path.open("wb") as file:
         pickle.dump(payload, file, protocol=pickle.HIGHEST_PROTOCOL)
+
+
+async def _rebuild_clean_inpainted_image(
+    translator: Any,
+    config: Any,
+    payload: dict[str, Any],
+    regions: list[Any],
+) -> np.ndarray:
+    enabled_regions = [region for region in regions if _region_enabled(region)]
+    if not enabled_regions:
+        return _copy_image_array(payload["img_rgb"])
+
+    for region in enabled_regions:
+        _set_region_geometry(region, getattr(region, "ocr_bbox", _region_bbox(region)))
+        _prepare_region_for_render(region, config)
+    ctx = SimpleNamespace(
+        text_regions=enabled_regions,
+        img_rgb=payload["img_rgb"],
+        img_inpainted=None,
+        img_alpha=payload.get("img_alpha"),
+        mask_raw=_make_mask_from_regions(payload["img_rgb"].shape, enabled_regions),
+        mask=None,
+        render_mask=None,
+    )
+    ctx.mask = await translator._run_mask_refinement(config, ctx)
+    clean = _image_array_for_png(await translator._run_inpainting(config, ctx))
+    if clean is None:
+        raise RuntimeError("重新生成干净底图失败")
+    return clean
+
+
+async def _clean_inpainted_for_rerender(
+    translator: Any,
+    config: Any,
+    payload: dict[str, Any],
+    regions: list[Any],
+) -> np.ndarray:
+    if payload.get("clean_image_trusted"):
+        clean = _image_array_for_png(payload.get("img_inpainted"))
+        if clean is not None:
+            return clean
+    return await _rebuild_clean_inpainted_image(translator, config, payload, regions)
 
 
 def serialize_regions(regions: list[Any]) -> list[dict[str, Any]]:
@@ -947,7 +1061,7 @@ class CoreEngine:
         core, translator = self._build(use_gpu)
         config = self._config(core, use_gpu)
         with context_path.open("rb") as file:
-            payload = _normalize_rerender_payload(pickle.load(file))
+            payload = _normalize_rerender_payload(pickle.load(file), context_path)
         width, height = _image_size_from_payload(payload)
         changed = set(changed_indices)
         existing_regions = payload.get("text_regions", []) or []
@@ -1058,6 +1172,10 @@ class CoreEngine:
             ctx.mask_raw = _make_mask_from_regions(payload["img_rgb"].shape, enabled_regions)
             ctx.mask = await translator._run_mask_refinement(config, ctx)
             ctx.img_inpainted = await translator._run_inpainting(config, ctx)
+            clean_inpainted = _image_array_for_png(ctx.img_inpainted)
+            if clean_inpainted is None:
+                raise RuntimeError("重新生成干净底图失败")
+            ctx.img_inpainted = _copy_image_array(clean_inpainted)
             for region in enabled_regions:
                 _set_region_geometry(
                     region, getattr(region, "render_bbox", _region_bbox(region))
@@ -1066,7 +1184,8 @@ class CoreEngine:
             ctx.text_regions = enabled_regions
             rendered = await translator._run_text_rendering(config, ctx)
         else:
-            ctx.img_inpainted = _copy_image_array(payload["img_rgb"])
+            clean_inpainted = _copy_image_array(payload["img_rgb"])
+            ctx.img_inpainted = _copy_image_array(clean_inpainted)
             rendered = ctx.img_inpainted
         with Image.open(input_path) as source:
             base_image = source.copy()
@@ -1082,7 +1201,7 @@ class CoreEngine:
                 "config": config,
                 "text_regions": all_regions,
                 "img_rgb": payload["img_rgb"],
-                "img_inpainted": _copy_image_array(ctx.img_inpainted),
+                "img_inpainted": clean_inpainted,
                 "img_alpha": payload.get("img_alpha"),
             },
         )
@@ -1099,7 +1218,7 @@ async def rerender(
 ) -> list[dict[str, Any]]:
     core = _import_core()
     with context_path.open("rb") as file:
-        payload = _normalize_rerender_payload(pickle.load(file))
+        payload = _normalize_rerender_payload(pickle.load(file), context_path)
     config = payload["config"]
     width, height = _image_size_from_payload(payload)
     all_regions = payload["text_regions"]
@@ -1129,15 +1248,6 @@ async def rerender(
         )
 
     render_regions = [region for region in all_regions if _region_enabled(region)]
-    for region in render_regions:
-        _prepare_region_for_render(region, config)
-    ctx = SimpleNamespace(
-        text_regions=render_regions,
-        img_rgb=payload["img_rgb"],
-        img_inpainted=_copy_image_array(payload["img_inpainted"]),
-        img_alpha=payload.get("img_alpha"),
-        render_mask=None,
-    )
 
     class RenderOnlyTranslator(core["MangaTranslator"]):
         def _setup_log_file(self):
@@ -1155,6 +1265,19 @@ async def rerender(
         }
     )
     try:
+        clean_inpainted = await _clean_inpainted_for_rerender(
+            translator, config, payload, all_regions
+        )
+        for region in render_regions:
+            _set_region_geometry(region, getattr(region, "render_bbox", _region_bbox(region)))
+            _prepare_region_for_render(region, config)
+        ctx = SimpleNamespace(
+            text_regions=render_regions,
+            img_rgb=payload["img_rgb"],
+            img_inpainted=_copy_image_array(clean_inpainted),
+            img_alpha=payload.get("img_alpha"),
+            render_mask=None,
+        )
         rendered = await translator._run_text_rendering(config, ctx)
         with Image.open(input_path) as source:
             base_image = source.copy()
@@ -1170,7 +1293,7 @@ async def rerender(
                 "config": config,
                 "text_regions": all_regions,
                 "img_rgb": payload["img_rgb"],
-                "img_inpainted": _copy_image_array(payload["img_inpainted"]),
+                "img_inpainted": clean_inpainted,
                 "img_alpha": payload.get("img_alpha"),
             },
         )
