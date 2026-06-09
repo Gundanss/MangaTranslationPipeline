@@ -48,6 +48,26 @@ class FakeRegion:
     def get_font_colors(self):
         return self._fg, self._bg
 
+    @property
+    def unrotated_size(self):
+        x1, y1, x2, y2 = self.xyxy.tolist()
+        return max(1, x2 - x1), max(1, y2 - y1)
+
+    @property
+    def direction(self):
+        return self._direction
+
+    @property
+    def vertical(self):
+        return str(self.direction).startswith("v")
+
+    @property
+    def horizontal(self):
+        return not self.vertical
+
+    def get_translation_for_rendering(self):
+        return self.translation
+
 
 class DummyProvider:
     def __init__(self, translations: dict[str, str] | None = None):
@@ -109,6 +129,66 @@ def test_serialize_regions_includes_ocr_and_render_boxes():
     assert data[0]["enabled"] is False
 
 
+def test_fit_region_font_size_shrinks_to_render_box(monkeypatch):
+    class FakeTextRender:
+        @staticmethod
+        def calc_horizontal(font_size, text, width, height, language, hyphenate):
+            return [text], [font_size * 4]
+
+        @staticmethod
+        def calc_vertical(font_size, text, height):
+            return [text], [font_size * max(len(text), 1)]
+
+    monkeypatch.setattr(engine, "_load_text_render", lambda: FakeTextRender())
+
+    region = SimpleNamespace(
+        translation="测试内容",
+        target_lang="CHS",
+        vertical=False,
+        unrotated_size=(40, 20),
+        get_translation_for_rendering=lambda: "测试内容",
+    )
+    config = SimpleNamespace(render=SimpleNamespace(no_hyphenation=True, line_spacing=None))
+
+    assert engine._fit_region_font_size(region, config) == 10
+
+
+def test_fit_region_font_size_initializes_text_render_font(monkeypatch):
+    class FakeTextRender:
+        initialized = False
+
+        @classmethod
+        def set_font(cls, font_path):
+            cls.initialized = bool(font_path)
+
+        @classmethod
+        def calc_horizontal(cls, font_size, text, width, height, language, hyphenate):
+            if not cls.initialized:
+                raise AttributeError("'NoneType' object has no attribute 'bitmap'")
+            return [text], [font_size * 2]
+
+        @classmethod
+        def calc_vertical(cls, font_size, text, height):
+            if not cls.initialized:
+                raise AttributeError("'NoneType' object has no attribute 'bitmap'")
+            return [text], [font_size * max(len(text), 1)]
+
+    monkeypatch.setattr(engine, "_load_text_render", lambda: FakeTextRender)
+    monkeypatch.setattr(engine, "_font_path", lambda: "/tmp/fake-font.ttf")
+
+    region = SimpleNamespace(
+        translation="到宫中",
+        target_lang="CHS",
+        vertical=True,
+        unrotated_size=(120, 160),
+        get_translation_for_rendering=lambda: "到宫中",
+    )
+    config = SimpleNamespace(render=SimpleNamespace(no_hyphenation=True, line_spacing=None))
+
+    assert engine._fit_region_font_size(region, config) > 6
+    assert FakeTextRender.initialized is True
+
+
 def test_rerender_uses_clean_background_and_latest_translation(tmp_path, monkeypatch):
     clean = np.zeros((4, 4, 3), dtype=np.uint8)
     rendered_old = np.full((4, 4, 3), 50, dtype=np.uint8)
@@ -146,6 +226,17 @@ def test_rerender_uses_clean_background_and_latest_translation(tmp_path, monkeyp
             "MangaTranslator": FakeTranslator,
             "dump_image": lambda base_image, rendered, alpha: Image.fromarray(rendered),
         },
+    )
+    monkeypatch.setattr(
+        engine,
+        "_load_text_render",
+        lambda: SimpleNamespace(
+            calc_horizontal=lambda font_size, text, width, height, lang, hyphenate: (
+                [text],
+                [min(width, max(1, font_size * max(len(text), 1) // 2))],
+            ),
+            calc_vertical=lambda font_size, text, height: ([text], [min(height, font_size)]),
+        ),
     )
     monkeypatch.setattr(engine, "_font_path", lambda: "")
 
@@ -222,6 +313,17 @@ def test_rerender_prefers_clean_sidecar_over_dirty_payload(tmp_path, monkeypatch
             "MangaTranslator": FakeTranslator,
             "dump_image": lambda base_image, rendered, alpha: Image.fromarray(rendered),
         },
+    )
+    monkeypatch.setattr(
+        engine,
+        "_load_text_render",
+        lambda: SimpleNamespace(
+            calc_horizontal=lambda font_size, text, width, height, lang, hyphenate: (
+                [text],
+                [min(width, max(1, font_size * max(len(text), 1) // 2))],
+            ),
+            calc_vertical=lambda font_size, text, height: ([text], [min(height, font_size)]),
+        ),
     )
     monkeypatch.setattr(engine, "_font_path", lambda: "")
 
@@ -332,6 +434,7 @@ def test_reprocess_regions_returns_new_ocr_and_translation(tmp_path, monkeypatch
                 "img_rgb": clean.copy(),
                 "img_inpainted": clean.copy(),
                 "img_alpha": None,
+                "clean_image_trusted": True,
             },
             file,
         )
@@ -369,6 +472,17 @@ def test_reprocess_regions_returns_new_ocr_and_translation(tmp_path, monkeypatch
             return ctx.img_inpainted
 
     monkeypatch.setattr(engine, "_mps_available", lambda: False)
+    monkeypatch.setattr(
+        engine,
+        "_load_text_render",
+        lambda: SimpleNamespace(
+            calc_horizontal=lambda font_size, text, width, height, lang, hyphenate: (
+                [text],
+                [min(width, max(1, font_size * max(len(text), 1) // 2))],
+            ),
+            calc_vertical=lambda font_size, text, height: ([text], [min(height, font_size)]),
+        ),
+    )
     monkeypatch.setattr(
         engine.CoreEngine,
         "_build",
@@ -528,6 +642,17 @@ def test_reprocess_manual_box_detects_and_merges_inner_textlines(
 
     monkeypatch.setattr(engine, "_mps_available", lambda: False)
     monkeypatch.setattr(
+        engine,
+        "_load_text_render",
+        lambda: SimpleNamespace(
+            calc_horizontal=lambda font_size, text, width, height, lang, hyphenate: (
+                text.split("\n"),
+                [min(width, max(1, font_size * max(len(line), 1) // 2)) for line in text.split("\n")],
+            ),
+            calc_vertical=lambda font_size, text, height: ([text], [min(height, font_size * max(len(text), 1))]),
+        ),
+    )
+    monkeypatch.setattr(
         engine.CoreEngine,
         "_build",
         lambda self, use_gpu: (
@@ -589,3 +714,89 @@ def test_reprocess_manual_box_detects_and_merges_inner_textlines(
     assert regions[0]["text"] == "右左"
     assert regions[0]["translation"] == "合并译文"
     assert np.array_equal(np.array(Image.open(output_path)), clean + 9)
+
+
+def test_rerender_preserves_multiline_translation_and_auto_font_size(
+    tmp_path, monkeypatch
+):
+    clean = np.zeros((8, 8, 3), dtype=np.uint8)
+    input_path = tmp_path / "input.png"
+    output_path = tmp_path / "output.png"
+    context_path = tmp_path / "context.pkl"
+    regions_path = tmp_path / "regions.json"
+    Image.fromarray(clean).save(input_path)
+
+    region = FakeRegion("old text")
+    region.text = "原文"
+    region.lines = np.array([[[0, 0], [24, 0], [24, 48], [0, 48]]])
+    region.ocr_bbox = [0, 0, 24, 48]
+    region.render_bbox = [0, 0, 24, 48]
+    with context_path.open("wb") as file:
+        pickle.dump(
+            {
+                "config": SimpleNamespace(render=SimpleNamespace(no_hyphenation=True, line_spacing=None)),
+                "text_regions": [region],
+                "img_rgb": clean.copy(),
+                "img_inpainted": clean.copy(),
+                "img_alpha": None,
+                "clean_image_trusted": True,
+            },
+            file,
+        )
+
+    class FakeTranslator:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        async def _run_text_rendering(self, config, ctx):
+            assert ctx.text_regions[0].translation == "第一行\n第二行"
+            assert ctx.text_regions[0]._alignment == "left"
+            assert ctx.text_regions[0].font_size >= 6
+            return ctx.img_inpainted + 3
+
+    monkeypatch.setattr(
+        engine,
+        "_import_core",
+        lambda: {
+            "MangaTranslator": FakeTranslator,
+            "dump_image": lambda base_image, rendered, alpha: Image.fromarray(rendered),
+        },
+    )
+    monkeypatch.setattr(
+        engine,
+        "_load_text_render",
+        lambda: SimpleNamespace(
+            calc_horizontal=lambda font_size, text, width, height, lang, hyphenate: (
+                text.split("\n"),
+                [min(width, max(1, font_size * max(len(line), 1) // 2)) for line in text.split("\n")],
+            ),
+            calc_vertical=lambda font_size, text, height: ([text], [min(height, font_size * max(len(text), 1))]),
+        ),
+    )
+    monkeypatch.setattr(engine, "_font_path", lambda: "")
+
+    regions = asyncio.run(
+        engine.rerender(
+            context_path,
+            regions_path,
+            output_path,
+            input_path,
+            [
+                {
+                    "index": 0,
+                    "ocr_bbox": [0, 0, 24, 48],
+                    "render_bbox": [0, 0, 24, 48],
+                    "text": "原文",
+                    "translation": "第一行\n第二行",
+                    "font_size": None,
+                    "direction": "horizontal",
+                    "alignment": "left",
+                    "foreground": "#000000",
+                    "outline": "#FFFFFF",
+                }
+            ],
+        )
+    )
+
+    assert regions[0]["font_size"] is None
+    assert regions[0]["alignment"] == "left"

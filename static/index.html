@@ -15,9 +15,11 @@
       </div>
       <div class="top-actions">
         <span id="healthChip" class="chip">检查环境中</span>
+        <button id="stopServiceButton" class="button danger" type="button">停止服务</button>
         <button id="settingsButton" class="button secondary">API 设置</button>
       </div>
     </header>
+    <div id="serviceBanner" class="service-banner hidden"></div>
 
     <main class="layout">
       <aside class="sidebar">
@@ -214,8 +216,8 @@
                   </label>
                   <div class="grid-two">
                     <label class="field">
-                      <span>字号</span>
-                      <input id="regionFontSize" type="number" min="6" max="300" />
+                      <span>字号（留空自动）</span>
+                      <input id="regionFontSize" type="number" min="6" max="300" placeholder="自动适配文本框" />
                     </label>
                     <label class="field">
                       <span>方向</span>

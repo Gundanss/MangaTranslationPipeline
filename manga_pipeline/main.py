@@ -8,6 +8,7 @@ from datetime import datetime
 from pathlib import Path
 
 from fastapi import (
+    BackgroundTasks,
     FastAPI,
     File,
     Form,
@@ -44,6 +45,7 @@ ensure_runtime_dirs()
 database = Database()
 secrets = SecretStore()
 manager = TaskManager(database, secrets)
+LOCAL_CLIENTS = {"127.0.0.1", "::1", "localhost", "testclient"}
 
 
 @asynccontextmanager
@@ -149,6 +151,17 @@ async def _validate_config(config: TaskConfig) -> None:
             )
 
 
+def _require_local_request(request: Request) -> None:
+    host = request.client.host if request.client else None
+    if host not in LOCAL_CLIENTS:
+        raise HTTPException(status_code=403, detail="仅允许本机请求停止本地服务")
+
+
+def _ensure_service_writable() -> None:
+    if manager.is_shutting_down:
+        raise HTTPException(status_code=503, detail="服务正在停止，暂不接受新的处理请求")
+
+
 @app.get("/")
 async def index():
     return FileResponse(STATIC_DIR / "index.html")
@@ -164,6 +177,7 @@ async def health():
     }
     return {
         "ok": True,
+        "shutting_down": manager.is_shutting_down,
         "core_present": (VENDOR_CORE_DIR / "manga_translator" / "__init__.py").exists(),
         "models": {name: path.exists() for name, path in required_models.items()},
         "output_dir": str(OUTPUT_DIR),
@@ -196,6 +210,7 @@ async def create_task(
     config_json: str = Form(...),
     relative_paths: list[str] = Form(default=[]),
 ):
+    _ensure_service_writable()
     try:
         config = TaskConfig.model_validate_json(config_json)
     except Exception as exc:
@@ -258,6 +273,27 @@ async def create_task(
     await manager.enqueue(task_id)
     task = database.get_task(task_id)
     return _task_public(task)
+
+
+@app.post("/api/system/shutdown")
+async def shutdown_system(request: Request, background_tasks: BackgroundTasks):
+    _require_local_request(request)
+    payload = {
+        "ok": True,
+        "mode": "graceful",
+        "message": "停止请求已受理，服务会在当前这张图片处理完成后关闭。",
+    }
+    if manager.is_shutting_down:
+        return {
+            **payload,
+            "message": "停止请求已受理，服务正在关闭中。",
+        }
+    background_tasks.add_task(manager.request_shutdown)
+    if manager.active_task_id is None and manager.active_manual_edits == 0:
+        payload["message"] = "停止请求已受理，当前没有处理中的图片，服务即将关闭。"
+    elif manager.active_task_id is None:
+        payload["message"] = "停止请求已受理，当前编辑操作完成后关闭服务。"
+    return payload
 
 
 @app.get("/api/tasks")
@@ -335,6 +371,7 @@ async def get_regions(image_id: str):
 
 @app.post("/api/images/{image_id}/rerender")
 async def rerender_image(image_id: str, request: RerenderRequest):
+    _ensure_service_writable()
     image = database.get_image(image_id)
     if not image:
         raise HTTPException(status_code=404, detail="图片不存在")
@@ -365,6 +402,7 @@ async def rerender_image(image_id: str, request: RerenderRequest):
 
 @app.post("/api/images/{image_id}/reprocess-regions")
 async def reprocess_regions(image_id: str, request: ReprocessRegionsRequest):
+    _ensure_service_writable()
     image = database.get_image(image_id)
     if not image:
         raise HTTPException(status_code=404, detail="图片不存在")

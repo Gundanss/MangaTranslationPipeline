@@ -119,6 +119,16 @@ def _enum_value(value: Any, fallback: str = "auto") -> str:
     return str(getattr(value, "value", value))
 
 
+def _normalize_optional_font_size(value: Any) -> int | None:
+    if value in (None, ""):
+        return None
+    try:
+        normalized = int(round(float(value)))
+    except (TypeError, ValueError):
+        return None
+    return max(6, min(300, normalized))
+
+
 def _rgb_hex(value: Any) -> str:
     channels = [max(0, min(255, int(channel))) for channel in value]
     return "#" + "".join(f"{channel:02X}" for channel in channels[:3])
@@ -259,6 +269,21 @@ def _bbox_from_update(update: dict[str, Any], name: str, fallback: list[int]) ->
     return update.get(name) or update.get("bbox") or fallback
 
 
+def _set_region_font_preference(region: Any, value: Any) -> None:
+    normalized = _normalize_optional_font_size(value)
+    region._font_size_user = normalized
+    region._font_size_auto = normalized is None
+
+
+def _region_font_preference(region: Any) -> int | None:
+    if getattr(region, "_font_size_auto", False):
+        return None
+    preferred = _normalize_optional_font_size(getattr(region, "_font_size_user", None))
+    if preferred is not None:
+        return preferred
+    return _normalize_optional_font_size(getattr(region, "font_size", None))
+
+
 def _normalize_region_updates(
     updates: list[dict[str, Any]], width: int, height: int
 ) -> list[dict[str, Any]]:
@@ -278,6 +303,7 @@ def _normalize_region_updates(
                 "bbox": render_bbox,
                 "enabled": bool(update.get("enabled", True)),
                 "translation": sanitize_translation_text(update.get("translation", "")),
+                "font_size": _normalize_optional_font_size(update.get("font_size")),
             }
         )
     return normalized
@@ -318,6 +344,20 @@ def _config_target_lang(config: Any) -> str:
     return target if target and target != "None" else "CHS"
 
 
+def _config_render_line_spacing(config: Any) -> float | None:
+    render = getattr(config, "render", None)
+    value = getattr(render, "line_spacing", None)
+    try:
+        return float(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _config_render_hyphenate(config: Any) -> bool:
+    render = getattr(config, "render", None)
+    return not bool(getattr(render, "no_hyphenation", False))
+
+
 def _config_render_direction(config: Any) -> str:
     return _config_section_value(config, "render", "direction", "auto")
 
@@ -353,6 +393,74 @@ def _prepare_region_for_render(
     region.adjust_bg_color = False
 
 
+def _load_text_render():
+    vendor = str(VENDOR_CORE_DIR)
+    if vendor not in sys.path:
+        sys.path.insert(0, vendor)
+    from manga_translator.rendering import text_render
+
+    return text_render
+
+
+def _fit_region_font_size(region: Any, config: Any) -> int:
+    preferred = _region_font_preference(region)
+    width, height = getattr(region, "unrotated_size", (0, 0))
+    width = max(2, int(round(width)))
+    height = max(2, int(round(height)))
+    upper = preferred if preferred is not None else max(6, min(width, height))
+    upper = max(6, upper)
+    text = getattr(region, "get_translation_for_rendering", lambda: getattr(region, "translation", ""))()
+    if not text or not str(text).strip():
+        return upper
+
+    text_render = _load_text_render()
+    if hasattr(text_render, "set_font"):
+        try:
+            text_render.set_font(_font_path())
+        except Exception:
+            return upper
+    hyphenate = _config_render_hyphenate(config)
+    line_spacing = _config_render_line_spacing(config)
+    target_lang = getattr(region, "target_lang", "en_US")
+
+    def fits(font_size: int) -> bool:
+        if getattr(region, "vertical", False):
+            columns, heights = text_render.calc_vertical(font_size, text, height)
+            spacing_x = int(font_size * (line_spacing or 0.2))
+            used_width = font_size * len(columns) + spacing_x * max(0, len(columns) - 1)
+            used_height = max(heights) if heights else 0
+            return used_width <= width and used_height <= height
+
+        lines, widths = text_render.calc_horizontal(
+            font_size,
+            text,
+            width,
+            height,
+            target_lang,
+            hyphenate,
+        )
+        spacing_y = int(font_size * (line_spacing or 0.01))
+        used_height = font_size * len(lines) + spacing_y * max(0, len(lines) - 1)
+        used_width = max(widths) if widths else 0
+        return used_width <= width and used_height <= height
+
+    best = 6
+    low, high = 6, upper
+    try:
+        if not fits(low):
+            return low
+        while low <= high:
+            middle = (low + high) // 2
+            if fits(middle):
+                best = middle
+                low = middle + 1
+            else:
+                high = middle - 1
+    except Exception:
+        return low
+    return best
+
+
 def _make_text_region(
     core: dict[str, Any],
     bbox: list[int],
@@ -373,6 +481,7 @@ def _make_text_region(
     block.text_raw = block.text
     block.adjust_bg_color = False
     _update_bbox_fields(block, bbox, bbox)
+    _set_region_font_preference(block, font_size)
     return block
 
 
@@ -397,6 +506,7 @@ def _ensure_payload_region_boxes(payload: dict[str, Any]) -> dict[str, Any]:
         ocr_bbox = _clip_bbox(getattr(region, "ocr_bbox", xyxy), width, height)
         render_bbox = _clip_bbox(getattr(region, "render_bbox", xyxy), width, height)
         _update_bbox_fields(region, ocr_bbox, render_bbox)
+        _set_region_font_preference(region, _region_font_preference(region))
         if config is not None:
             _prepare_region_for_render(region, config)
     return payload
@@ -575,6 +685,7 @@ def serialize_regions(regions: list[Any]) -> list[dict[str, Any]]:
     result: list[dict[str, Any]] = []
     for index, region in enumerate(regions or []):
         foreground, outline = region.get_font_colors()
+        font_size = _region_font_preference(region)
         xyxy = _region_bbox(region)
         ocr_bbox = [
             int(value) for value in getattr(region, "ocr_bbox", xyxy)
@@ -593,7 +704,7 @@ def serialize_regions(regions: list[Any]) -> list[dict[str, Any]]:
                 "translation": sanitize_translation_text(
                     getattr(region, "translation", "")
                 ),
-                "font_size": max(6, int(region.font_size)),
+                "font_size": font_size,
                 "direction": _public_direction(
                     getattr(region, "_direction", "auto")
                 ),
@@ -1094,13 +1205,13 @@ class CoreEngine:
                 region.translation = sanitize_translation_text(
                     update.get("translation", "")
                 )
-                region.font_size = update["font_size"]
                 region._direction = _core_direction(update["direction"])
                 region._alignment = update["alignment"]
                 region.set_font_colors(
                     _hex_rgb(update["foreground"]),
                     _hex_rgb(update["outline"]),
                 )
+            _set_region_font_preference(region, update.get("font_size"))
             _prepare_region_for_render(
                 region,
                 config,
@@ -1181,6 +1292,7 @@ class CoreEngine:
                     region, getattr(region, "render_bbox", _region_bbox(region))
                 )
                 _prepare_region_for_render(region, config)
+                region.font_size = _fit_region_font_size(region, config)
             ctx.text_regions = enabled_regions
             rendered = await translator._run_text_rendering(config, ctx)
         else:
@@ -1232,7 +1344,7 @@ async def rerender(
         region = all_regions[update["index"]]
         region.text = update["text"]
         region.translation = sanitize_translation_text(update["translation"])
-        region.font_size = update["font_size"]
+        _set_region_font_preference(region, update.get("font_size"))
         region.set_font_colors(
             _hex_rgb(update["foreground"]),
             _hex_rgb(update["outline"]),
@@ -1271,6 +1383,7 @@ async def rerender(
         for region in render_regions:
             _set_region_geometry(region, getattr(region, "render_bbox", _region_bbox(region)))
             _prepare_region_for_render(region, config)
+            region.font_size = _fit_region_font_size(region, config)
         ctx = SimpleNamespace(
             text_regions=render_regions,
             img_rgb=payload["img_rgb"],

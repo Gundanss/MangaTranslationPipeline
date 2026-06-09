@@ -15,6 +15,9 @@ const state = {
   dirtyOcrIndices: new Set(),
   dragState: null,
   logsAutoFollow: true,
+  serverStopping: false,
+  serverStopped: false,
+  shutdownPoll: null,
 };
 
 const stageNames = {
@@ -24,11 +27,11 @@ const stageNames = {
   translating: "翻译中", "after-translating": "翻译校验", "mask-generation": "生成去字掩膜",
   inpainting: "去除原文", rendering: "自动嵌字", saved: "保存结果",
   finished: "已完成", error: "处理失败", rerender: "重新嵌字", retry: "翻译重试",
-  "manual-ocr": "人工 OCR 框",
+  "manual-ocr": "人工 OCR 框", shutdown: "停止中", stopped: "已停止",
 };
 const statusNames = {
   queued: "排队中", running: "处理中", completed: "已完成",
-  completed_with_errors: "部分失败", failed: "失败", idle: "空闲",
+  completed_with_errors: "部分失败", failed: "失败", stopped: "已停止", idle: "空闲",
 };
 
 async function api(url, options = {}) {
@@ -47,13 +50,79 @@ function formatBytes(bytes) {
   return `${value.toFixed(index > 1 ? 1 : 0)} ${units[index]}`;
 }
 
+function setHealthChip(text, color) {
+  $("healthChip").textContent = text;
+  $("healthChip").style.color = color;
+}
+
+function setServiceBanner(message = "", tone = "warning") {
+  const banner = $("serviceBanner");
+  banner.textContent = message;
+  banner.classList.toggle("hidden", !message);
+  banner.classList.toggle("error", tone === "error");
+}
+
+function setMutationControlsDisabled(disabled) {
+  [
+    "startButton",
+    "refreshModels",
+    "addRegionButton",
+    "toggleRegionButton",
+    "reprocessButton",
+    "rerenderButton",
+    "saveSettings",
+  ].forEach((id) => {
+    const element = $(id);
+    if (element) element.disabled = disabled;
+  });
+}
+
+function markServiceStopping(message) {
+  state.serverStopping = true;
+  state.serverStopped = false;
+  $("stopServiceButton").disabled = true;
+  $("stopServiceButton").textContent = "正在停止...";
+  setMutationControlsDisabled(true);
+  setHealthChip("服务正在停止", "#ffd08e");
+  setServiceBanner(message, "warning");
+}
+
+function markServiceStopped(message = "服务已停止，请重新双击启动脚本后刷新页面。") {
+  state.serverStopping = false;
+  state.serverStopped = true;
+  if (state.shutdownPoll) {
+    clearTimeout(state.shutdownPoll);
+    state.shutdownPoll = null;
+  }
+  if (state.eventSource) {
+    state.eventSource.close();
+    state.eventSource = null;
+  }
+  $("stopServiceButton").disabled = true;
+  $("stopServiceButton").textContent = "服务已停止";
+  setMutationControlsDisabled(true);
+  setHealthChip("服务已停止", "#ffb0b0");
+  setServiceBanner(message, "error");
+  $("formMessage").textContent = message;
+  $("editorMessage").textContent = message;
+}
+
 async function loadHealth() {
   try {
     const health = await api("/api/health");
+    if (health.shutting_down) {
+      markServiceStopping("服务正在停止，会在当前这张图片处理完成后关闭。");
+      return;
+    }
     const ready = health.core_present && Object.values(health.models).every(Boolean);
-    $("healthChip").textContent = ready ? "图像模型已就绪" : "需要首次安装";
-    $("healthChip").style.color = ready ? "#a9f0cf" : "#ffd08e";
-  } catch { $("healthChip").textContent = "环境检查失败"; }
+    setHealthChip(ready ? "图像模型已就绪" : "需要首次安装", ready ? "#a9f0cf" : "#ffd08e");
+  } catch {
+    if (state.serverStopping || state.serverStopped) {
+      markServiceStopped();
+      return;
+    }
+    setHealthChip("环境检查失败", "#ffb0b0");
+  }
 }
 
 async function loadSettings() {
@@ -127,6 +196,10 @@ function setFiles(fileList) {
 
 async function createTask() {
   $("formMessage").textContent = "";
+  if (state.serverStopping || state.serverStopped) {
+    $("formMessage").textContent = "服务已进入停止流程，请重新启动后再创建任务";
+    return;
+  }
   if (!state.files.length) {
     $("formMessage").textContent = "请先选择单张图片或图片文件夹";
     return;
@@ -159,7 +232,7 @@ async function createTask() {
   } catch (error) {
     $("formMessage").textContent = error.message;
   } finally {
-    $("startButton").disabled = false;
+    $("startButton").disabled = state.serverStopping || state.serverStopped;
     $("startButton").textContent = "开始翻译";
   }
 }
@@ -185,6 +258,7 @@ async function loadTasks() {
 }
 
 function activateTask(taskId) {
+  if (state.serverStopped) return;
   state.logs.clear();
   state.logsAutoFollow = true;
   $("logWindow").innerHTML = "";
@@ -197,7 +271,11 @@ function activateTask(taskId) {
     renderTask();
     renderLogs();
   };
-  state.eventSource.onerror = () => {};
+  state.eventSource.onerror = () => {
+    if (state.serverStopping) {
+      markServiceStopped();
+    }
+  };
 }
 
 function renderTask() {
@@ -249,6 +327,13 @@ function renderImageStrip(images) {
   });
 }
 
+function normalizeOptionalFontSize(value) {
+  if (value === null || value === undefined || value === "") return null;
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed < 6) return null;
+  return Math.round(parsed);
+}
+
 function ensureRegionShape(region, index) {
   const fallback = region.render_bbox || region.ocr_bbox || region.bbox || [0, 0, 80, 80];
   region.index = index;
@@ -256,9 +341,9 @@ function ensureRegionShape(region, index) {
   region.render_bbox = region.render_bbox || fallback;
   region.bbox = region.render_bbox;
   region.enabled = region.enabled !== false;
-  region.font_size = region.font_size || 32;
+  region.font_size = normalizeOptionalFontSize(region.font_size);
   region.direction = region.direction || "auto";
-  region.alignment = region.alignment || "auto";
+  region.alignment = region.alignment || "left";
   region.foreground = region.foreground || "#000000";
   region.outline = region.outline || "#FFFFFF";
   region.text = region.text || "";
@@ -352,6 +437,10 @@ function setEditorMode(mode) {
 }
 
 async function openImage(image) {
+  if (state.serverStopping || state.serverStopped) {
+    $("editorMessage").textContent = "服务已停止，重新启动后才能继续校正";
+    return;
+  }
   if (!isImageEditable(image)) {
     $("editorMessage").textContent = "这张图片还在处理中，完成后即可校正";
     return;
@@ -495,9 +584,9 @@ function populateRegionForm(index) {
   $("regionNumber").textContent = `区域 #${index + 1}`;
   $("regionText").value = region.text;
   $("regionTranslation").value = region.translation;
-  $("regionFontSize").value = region.font_size;
+  $("regionFontSize").value = region.font_size ?? "";
   $("regionDirection").value = ["auto", "horizontal", "vertical"].includes(region.direction) ? region.direction : "auto";
-  $("regionAlignment").value = ["auto", "left", "center", "right"].includes(region.alignment) ? region.alignment : "auto";
+  $("regionAlignment").value = ["auto", "left", "center", "right"].includes(region.alignment) ? region.alignment : "left";
   $("regionForeground").value = region.foreground;
   $("regionOutline").value = region.outline;
   $("toggleRegionButton").textContent = region.enabled ? "禁用区域" : "恢复区域";
@@ -516,7 +605,7 @@ function syncActiveRegion() {
   if (!region) return;
   region.text = $("regionText").value;
   region.translation = $("regionTranslation").value;
-  region.font_size = Number($("regionFontSize").value);
+  region.font_size = normalizeOptionalFontSize($("regionFontSize").value);
   region.direction = $("regionDirection").value;
   region.alignment = $("regionAlignment").value;
   region.foreground = $("regionForeground").value;
@@ -525,6 +614,10 @@ function syncActiveRegion() {
 }
 
 function addRegion() {
+  if (state.serverStopping || state.serverStopped) {
+    $("editorMessage").textContent = "服务已停止，重新启动后才能新增 OCR 框";
+    return;
+  }
   if (!state.activeImage || !$("resultImage").naturalWidth) return;
   if (!isImageEditable(state.activeImage)) {
     $("editorMessage").textContent = "这张图片还在处理中，完成后即可新增 OCR 框";
@@ -547,9 +640,9 @@ function addRegion() {
     enabled: true,
     text: "",
     translation: "",
-    font_size: 32,
+    font_size: null,
     direction: "auto",
-    alignment: "auto",
+    alignment: "left",
     foreground: "#000000",
     outline: "#FFFFFF",
   }, index));
@@ -559,6 +652,10 @@ function addRegion() {
 }
 
 function toggleRegion() {
+  if (state.serverStopping || state.serverStopped) {
+    $("editorMessage").textContent = "服务已停止，重新启动后才能修改区域";
+    return;
+  }
   if (state.activeRegion === null) return;
   const region = state.regions[state.activeRegion];
   region.enabled = !region.enabled;
@@ -568,6 +665,10 @@ function toggleRegion() {
 }
 
 async function reprocessRegions() {
+  if (state.serverStopping || state.serverStopped) {
+    $("editorMessage").textContent = "服务已停止，重新启动后才能重新识别";
+    return;
+  }
   if (!state.activeImage) return;
   if (!isImageEditable(state.activeImage)) {
     $("editorMessage").textContent = "这张图片还在处理中，完成后即可重新识别";
@@ -612,12 +713,16 @@ async function reprocessRegions() {
   } catch (error) {
     $("editorMessage").textContent = error.message;
   } finally {
-    $("reprocessButton").disabled = false;
-    $("rerenderButton").disabled = false;
+    $("reprocessButton").disabled = state.serverStopping || state.serverStopped;
+    $("rerenderButton").disabled = state.serverStopping || state.serverStopped;
   }
 }
 
 async function rerenderImage() {
+  if (state.serverStopping || state.serverStopped) {
+    $("editorMessage").textContent = "服务已停止，重新启动后才能重新嵌字";
+    return;
+  }
   if (!state.activeImage) return;
   if (!isImageEditable(state.activeImage)) {
     $("editorMessage").textContent = "这张图片还在处理中，完成后即可重新嵌字";
@@ -652,7 +757,7 @@ async function rerenderImage() {
   } catch (error) {
     $("editorMessage").textContent = error.message;
   } finally {
-    $("rerenderButton").disabled = false;
+    $("rerenderButton").disabled = state.serverStopping || state.serverStopped;
   }
 }
 
@@ -697,7 +802,55 @@ function renderLogs() {
   }
 }
 
+async function waitForServiceStop(attempt = 0) {
+  try {
+    const health = await api("/api/health");
+    if (!health.shutting_down && attempt > 0) {
+      setServiceBanner("停止请求已发送，正在等待服务退出...", "warning");
+    }
+  } catch {
+    markServiceStopped();
+    return;
+  }
+  if (attempt >= 240) {
+    setServiceBanner("停止请求已发送，但服务仍未完全退出。可以稍候片刻，或双击停止脚本。", "warning");
+    $("stopServiceButton").disabled = false;
+    $("stopServiceButton").textContent = "再次检查停止状态";
+    return;
+  }
+  state.shutdownPoll = setTimeout(() => {
+    waitForServiceStop(attempt + 1);
+  }, 500);
+}
+
+async function stopService() {
+  if (state.serverStopped) return;
+  if (state.serverStopping) {
+    await waitForServiceStop();
+    return;
+  }
+  const confirmed = window.confirm("停止服务后，当前这张图片会处理完成，随后整个本地系统关闭。确定继续吗？");
+  if (!confirmed) return;
+  markServiceStopping("停止请求已发送，服务会在当前这张图片处理完成后关闭。");
+  try {
+    const result = await api("/api/system/shutdown", { method: "POST" });
+    setServiceBanner(result.message || "停止请求已受理，正在关闭服务。", "warning");
+    await waitForServiceStop();
+  } catch (error) {
+    state.serverStopping = false;
+    $("stopServiceButton").disabled = false;
+    $("stopServiceButton").textContent = "停止服务";
+    setMutationControlsDisabled(false);
+    setServiceBanner(error.message, "error");
+    await loadHealth();
+  }
+}
+
 async function saveSettings() {
+  if (state.serverStopping || state.serverStopped) {
+    $("settingsMessage").textContent = "服务已停止，重新启动后才能保存设置";
+    return;
+  }
   const payload = {
     ollama_base_url: $("ollamaBaseUrl").value,
     microsoft_region: $("microsoftRegion").value,
@@ -734,6 +887,7 @@ function bindEvents() {
   $("refreshModels").onclick = loadModels;
   $("startButton").onclick = createTask;
   $("refreshTasks").onclick = loadTasks;
+  $("stopServiceButton").onclick = stopService;
   $("ocrModeButton").onclick = () => setEditorMode("ocr");
   $("renderModeButton").onclick = () => setEditorMode("render");
   $("addRegionButton").onclick = addRegion;
@@ -774,7 +928,9 @@ async function init() {
   updateEditorPlaceholder();
   updateProviderFields();
   await Promise.all([loadHealth(), loadSettings(), loadTasks()]);
-  await loadModels();
+  if (!state.serverStopping && !state.serverStopped) {
+    await loadModels();
+  }
 }
 
 init();
