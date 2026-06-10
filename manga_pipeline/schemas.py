@@ -51,7 +51,7 @@ class RegionUpdate(BaseModel):
     translation: str
     font_size: int | None = Field(default=None, ge=6, le=300)
     direction: TextDirection = "auto"
-    alignment: TextAlignment = "auto"
+    alignment: TextAlignment = "left"
     foreground: str = Field(pattern=r"^#[0-9A-Fa-f]{6}$")
     outline: str = Field(pattern=r"^#[0-9A-Fa-f]{6}$")
 

@@ -334,6 +334,10 @@ function normalizeOptionalFontSize(value) {
   return Math.round(parsed);
 }
 
+function normalizeRegionAlignment(value) {
+  return ["left", "center", "right"].includes(value) ? value : "left";
+}
+
 function ensureRegionShape(region, index) {
   const fallback = region.render_bbox || region.ocr_bbox || region.bbox || [0, 0, 80, 80];
   region.index = index;
@@ -343,7 +347,7 @@ function ensureRegionShape(region, index) {
   region.enabled = region.enabled !== false;
   region.font_size = normalizeOptionalFontSize(region.font_size);
   region.direction = region.direction || "auto";
-  region.alignment = region.alignment || "left";
+  region.alignment = normalizeRegionAlignment(region.alignment);
   region.foreground = region.foreground || "#000000";
   region.outline = region.outline || "#FFFFFF";
   region.text = region.text || "";
@@ -586,7 +590,7 @@ function populateRegionForm(index) {
   $("regionTranslation").value = region.translation;
   $("regionFontSize").value = region.font_size ?? "";
   $("regionDirection").value = ["auto", "horizontal", "vertical"].includes(region.direction) ? region.direction : "auto";
-  $("regionAlignment").value = ["auto", "left", "center", "right"].includes(region.alignment) ? region.alignment : "left";
+  $("regionAlignment").value = normalizeRegionAlignment(region.alignment);
   $("regionForeground").value = region.foreground;
   $("regionOutline").value = region.outline;
   $("toggleRegionButton").textContent = region.enabled ? "禁用区域" : "恢复区域";
