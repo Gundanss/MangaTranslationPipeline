@@ -111,3 +111,162 @@ def test_mutation_routes_reject_when_service_is_shutting_down(monkeypatch):
     assert create_response.status_code == 503
     assert rerender_response.status_code == 503
     assert reprocess_response.status_code == 503
+
+
+def test_normalize_region_json_adds_default_mask_dilation():
+    regions, changed = main._normalize_region_json(
+        [
+            {
+                "index": 0,
+                "bbox": [0, 0, 10, 10],
+                "enabled": True,
+                "text": "原文",
+                "translation": "译文",
+            }
+        ]
+    )
+
+    assert changed is True
+    assert regions[0]["mask_dilation_offset"] == 20
+
+
+class FakeDatabase:
+    def __init__(self, config):
+        self.config = config
+        self.logs = []
+
+    def get_image(self, image_id):
+        if image_id != "image-1":
+            return None
+        return {"id": "image-1", "task_id": "task-1"}
+
+    def get_task(self, task_id):
+        if task_id != "task-1":
+            return None
+        return {"id": "task-1", "config": self.config, "images": []}
+
+    def log(self, task_id, level, stage, message, image_id=None, details=None):
+        self.logs.append(
+            {
+                "task_id": task_id,
+                "level": level,
+                "stage": stage,
+                "message": message,
+                "image_id": image_id,
+                "details": details,
+            }
+        )
+
+
+class FakeSecrets:
+    def __init__(self, values=None):
+        self.values = {
+            "ollama_base_url": "http://localhost:11434",
+            "google_api_key": "",
+            "microsoft_api_key": "",
+            "microsoft_region": "",
+            "microsoft_endpoint": "https://api.cognitive.microsofttranslator.com",
+            "last_ollama_model": "",
+        }
+        self.values.update(values or {})
+
+    def get(self):
+        return self.values
+
+
+class FakeProvider:
+    def __init__(self):
+        self.log_callback = None
+
+    def set_log_callback(self, callback):
+        self.log_callback = callback
+
+    async def translate(self, texts, source, target):
+        return [f"{source}->{target}:{text}" for text in texts]
+
+
+def test_translate_region_machine_uses_task_online_provider(monkeypatch):
+    fake_database = FakeDatabase(
+        {"provider": "google", "source_language": "ja", "target_language": "zh-CN"}
+    )
+    captured = {}
+    monkeypatch.setattr(main, "manager", FakeManager())
+    monkeypatch.setattr(main, "database", fake_database)
+    monkeypatch.setattr(main, "secrets", FakeSecrets())
+
+    def fake_create_provider(name, settings, ollama_model):
+        captured.update({"name": name, "ollama_model": ollama_model})
+        return FakeProvider()
+
+    monkeypatch.setattr(main, "create_provider", fake_create_provider)
+
+    response = asyncio.run(
+        request_json(
+            "/api/images/image-1/translate-region",
+            method="POST",
+            json={"mode": "machine", "text": "勉強しなさい"},
+        )
+    )
+
+    assert response.status_code == 200
+    assert response.json()["translation"] == "ja->zh-CN:勉強しなさい"
+    assert captured == {"name": "google", "ollama_model": None}
+    assert fake_database.logs[-1]["stage"] == "translation"
+
+
+def test_translate_region_machine_rejects_ollama_task(monkeypatch):
+    monkeypatch.setattr(main, "manager", FakeManager())
+    monkeypatch.setattr(
+        main,
+        "database",
+        FakeDatabase(
+            {
+                "provider": "ollama",
+                "source_language": "ja",
+                "target_language": "zh-CN",
+                "ollama_model": "task-model",
+            }
+        ),
+    )
+    monkeypatch.setattr(main, "secrets", FakeSecrets())
+
+    response = asyncio.run(
+        request_json(
+            "/api/images/image-1/translate-region",
+            method="POST",
+            json={"mode": "machine", "text": "勉強しなさい"},
+        )
+    )
+
+    assert response.status_code == 400
+    assert "机器翻译只复用" in response.json()["detail"]
+
+
+def test_translate_region_ollama_uses_recent_model_fallback(monkeypatch):
+    captured = {}
+    monkeypatch.setattr(main, "manager", FakeManager())
+    monkeypatch.setattr(
+        main,
+        "database",
+        FakeDatabase(
+            {"provider": "google", "source_language": "ja", "target_language": "zh-CN"}
+        ),
+    )
+    monkeypatch.setattr(main, "secrets", FakeSecrets({"last_ollama_model": "last-model"}))
+
+    def fake_create_provider(name, settings, ollama_model):
+        captured.update({"name": name, "ollama_model": ollama_model})
+        return FakeProvider()
+
+    monkeypatch.setattr(main, "create_provider", fake_create_provider)
+
+    response = asyncio.run(
+        request_json(
+            "/api/images/image-1/translate-region",
+            method="POST",
+            json={"mode": "ollama", "text": "勉強しなさい"},
+        )
+    )
+
+    assert response.status_code == 200
+    assert captured == {"name": "ollama", "ollama_model": "last-model"}

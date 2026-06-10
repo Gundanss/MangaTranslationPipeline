@@ -123,6 +123,11 @@ small, .muted { color: var(--muted); font-size: 11px; }
 .button.danger { background: #8e2e2e; color: #fff; }
 .button.danger:hover { background: #712222; }
 .button.full { width: 100%; }
+.button.mini {
+  padding: 5px 8px;
+  font-size: 11px;
+  line-height: 1.2;
+}
 .text-button, .icon-button {
   border: 0;
   background: transparent;
@@ -178,6 +183,22 @@ small, .muted { color: var(--muted); font-size: 11px; }
 .upload-actions .button { flex: 1; padding: 9px 6px; font-size: 11px; }
 .file-summary { margin-top: 10px; font-size: 11px; color: var(--muted); }
 .form-message { min-height: 17px; margin-top: 8px; font-size: 11px; color: var(--danger); }
+.slider-field strong {
+  color: var(--accent-dark);
+  font-size: 12px;
+  min-width: 24px;
+  text-align: right;
+}
+.slider-field input[type="range"] {
+  padding: 0;
+  accent-color: var(--accent);
+}
+.inline-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
 .task-history { max-height: 310px; overflow: auto; }
 .task-row {
   width: 100%;

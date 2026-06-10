@@ -45,6 +45,9 @@ STAGE_PROGRESS = {
     "skip-no-regions": 1.0,
     "skip-no-text": 1.0,
 }
+DEFAULT_MASK_DILATION_OFFSET = 20
+MIN_MASK_DILATION_OFFSET = 0
+MAX_MASK_DILATION_OFFSET = 40
 
 
 class CoreUnavailableError(RuntimeError):
@@ -128,6 +131,24 @@ def _normalize_optional_font_size(value: Any) -> int | None:
     except (TypeError, ValueError):
         return None
     return max(6, min(300, normalized))
+
+
+def _normalize_mask_dilation_offset(value: Any) -> int:
+    try:
+        normalized = int(round(float(value)))
+    except (TypeError, ValueError):
+        normalized = DEFAULT_MASK_DILATION_OFFSET
+    return max(MIN_MASK_DILATION_OFFSET, min(MAX_MASK_DILATION_OFFSET, normalized))
+
+
+def _region_mask_dilation_offset(region: Any) -> int:
+    return _normalize_mask_dilation_offset(
+        getattr(region, "mask_dilation_offset", DEFAULT_MASK_DILATION_OFFSET)
+    )
+
+
+def _set_region_mask_dilation_offset(region: Any, value: Any) -> None:
+    region.mask_dilation_offset = _normalize_mask_dilation_offset(value)
 
 
 def _rgb_hex(value: Any) -> str:
@@ -305,6 +326,9 @@ def _normalize_region_updates(
                 "enabled": bool(update.get("enabled", True)),
                 "translation": sanitize_translation_text(update.get("translation", "")),
                 "font_size": _normalize_optional_font_size(update.get("font_size")),
+                "mask_dilation_offset": _normalize_mask_dilation_offset(
+                    update.get("mask_dilation_offset")
+                ),
             }
         )
     return normalized
@@ -325,6 +349,8 @@ def _fill_update_bbox_defaults(
                 item["render_bbox"] = getattr(region, "render_bbox", bbox)
             if not item.get("bbox"):
                 item["bbox"] = item["render_bbox"]
+            if "mask_dilation_offset" not in item:
+                item["mask_dilation_offset"] = _region_mask_dilation_offset(region)
         result.append(item)
     return result
 
@@ -470,6 +496,7 @@ def _make_text_region(
     foreground: tuple[int, int, int] = (0, 0, 0),
     outline: tuple[int, int, int] = (255, 255, 255),
     font_size: int | None = None,
+    mask_dilation_offset: int = DEFAULT_MASK_DILATION_OFFSET,
 ) -> Any:
     block = core["TextBlock"](
         [_bbox_to_polygon(bbox)],
@@ -483,6 +510,7 @@ def _make_text_region(
     block.adjust_bg_color = False
     _update_bbox_fields(block, bbox, bbox)
     _set_region_font_preference(block, font_size)
+    _set_region_mask_dilation_offset(block, mask_dilation_offset)
     return block
 
 
@@ -499,6 +527,52 @@ def _make_mask_from_regions(
     return mask
 
 
+async def _run_mask_refinement_by_region_offsets(
+    translator: Any,
+    config: Any,
+    image: np.ndarray,
+    regions: list[Any],
+) -> np.ndarray:
+    height, width = image.shape[:2]
+    combined = np.zeros((height, width), dtype=np.uint8)
+    groups: dict[int, list[Any]] = {}
+    for region in regions:
+        if not _region_enabled(region):
+            continue
+        groups.setdefault(_region_mask_dilation_offset(region), []).append(region)
+    if not groups:
+        return combined
+
+    original_offset = getattr(
+        config, "mask_dilation_offset", DEFAULT_MASK_DILATION_OFFSET
+    )
+    try:
+        for offset, group in groups.items():
+            config.mask_dilation_offset = offset
+            ctx = SimpleNamespace(
+                text_regions=group,
+                img_rgb=image,
+                mask_raw=_make_mask_from_regions(image.shape, group),
+                mask=None,
+                render_mask=None,
+            )
+            mask = await translator._run_mask_refinement(config, ctx)
+            if mask is None:
+                continue
+            mask = _image_array_for_png(mask)
+            if mask is None:
+                continue
+            if mask.ndim == 3:
+                mask = mask[:, :, 0]
+            if mask.shape[:2] != combined.shape[:2]:
+                mask = cv2.resize(mask, (width, height), interpolation=cv2.INTER_LINEAR)
+            combined = cv2.bitwise_or(combined, mask.astype(np.uint8))
+    finally:
+        config.mask_dilation_offset = original_offset
+    combined[combined > 0] = 255
+    return combined
+
+
 def _ensure_payload_region_boxes(payload: dict[str, Any]) -> dict[str, Any]:
     width, height = _image_size_from_payload(payload)
     config = payload.get("config")
@@ -508,6 +582,7 @@ def _ensure_payload_region_boxes(payload: dict[str, Any]) -> dict[str, Any]:
         render_bbox = _clip_bbox(getattr(region, "render_bbox", xyxy), width, height)
         _update_bbox_fields(region, ocr_bbox, render_bbox)
         _set_region_font_preference(region, _region_font_preference(region))
+        _set_region_mask_dilation_offset(region, _region_mask_dilation_offset(region))
         if config is not None:
             _prepare_region_for_render(region, config)
     return payload
@@ -658,11 +733,13 @@ async def _rebuild_clean_inpainted_image(
         img_rgb=payload["img_rgb"],
         img_inpainted=None,
         img_alpha=payload.get("img_alpha"),
-        mask_raw=_make_mask_from_regions(payload["img_rgb"].shape, enabled_regions),
+        mask_raw=None,
         mask=None,
         render_mask=None,
     )
-    ctx.mask = await translator._run_mask_refinement(config, ctx)
+    ctx.mask = await _run_mask_refinement_by_region_offsets(
+        translator, config, payload["img_rgb"], enabled_regions
+    )
     clean = _image_array_for_png(await translator._run_inpainting(config, ctx))
     if clean is None:
         raise RuntimeError("重新生成干净底图失败")
@@ -712,6 +789,7 @@ def serialize_regions(regions: list[Any]) -> list[dict[str, Any]]:
                 "alignment": _enum_value(getattr(region, "_alignment", "auto")),
                 "foreground": _rgb_hex(foreground),
                 "outline": _rgb_hex(outline),
+                "mask_dilation_offset": _region_mask_dilation_offset(region),
             }
         )
     return result
@@ -737,6 +815,7 @@ class CoreEngine:
         font_size: int | None,
         progress_callback: ProgressCallback,
         log_callback: LogCallback,
+        mask_dilation_offset: int = DEFAULT_MASK_DILATION_OFFSET,
     ):
         self.provider = provider
         self.source_language = source_language
@@ -745,6 +824,9 @@ class CoreEngine:
         self.render_direction = render_direction
         self.render_alignment = render_alignment
         self.font_size = font_size
+        self.mask_dilation_offset = _normalize_mask_dilation_offset(
+            mask_dilation_offset
+        )
         self.progress_callback = progress_callback
         self.log_callback = log_callback
         self.translation_cache: dict[tuple[str, ...], list[str]] = {}
@@ -866,7 +948,7 @@ class CoreEngine:
                 "font_size_minimum": -1,
                 "no_hyphenation": self.target_language.startswith("zh"),
             },
-            mask_dilation_offset=20,
+            mask_dilation_offset=self.mask_dilation_offset,
             kernel_size=3,
             force_simple_sort=False,
         )
@@ -1507,6 +1589,7 @@ class CoreEngine:
         regions_path: Path,
         updates: list[dict[str, Any]],
         changed_indices: list[int],
+        mask_changed_indices: list[int] | None = None,
     ) -> list[dict[str, Any]]:
         use_gpu = _mps_available()
         try:
@@ -1517,6 +1600,7 @@ class CoreEngine:
                 regions_path,
                 updates,
                 changed_indices,
+                mask_changed_indices or [],
                 use_gpu=use_gpu,
             )
         except Exception as exc:
@@ -1536,6 +1620,7 @@ class CoreEngine:
                 regions_path,
                 updates,
                 changed_indices,
+                mask_changed_indices or [],
                 use_gpu=False,
             )
 
@@ -1568,6 +1653,8 @@ class CoreEngine:
             ctx = await translator.translate(image, config)
             if not ctx.result:
                 raise RuntimeError("核心处理完成但未生成输出图片")
+            for region in getattr(ctx, "text_regions", []) or []:
+                _set_region_mask_dilation_offset(region, self.mask_dilation_offset)
             rerender_payload = _build_rerender_payload(ctx, config)
             _save_image(ctx.result, output_path)
             regions = serialize_regions(ctx.text_regions)
@@ -1603,6 +1690,7 @@ class CoreEngine:
         regions_path: Path,
         updates: list[dict[str, Any]],
         changed_indices: list[int],
+        mask_changed_indices: list[int],
         use_gpu: bool,
     ) -> list[dict[str, Any]]:
         core, translator = self._build(use_gpu)
@@ -1633,6 +1721,7 @@ class CoreEngine:
                     _hex_rgb(update["foreground"]),
                     _hex_rgb(update["outline"]),
                     update.get("font_size"),
+                    update["mask_dilation_offset"],
                 )
                 changed.add(update["index"])
             else:
@@ -1655,6 +1744,7 @@ class CoreEngine:
                 update["alignment"],
             )
             region.enabled = update["enabled"]
+            _set_region_mask_dilation_offset(region, update["mask_dilation_offset"])
             _update_bbox_fields(region, update["ocr_bbox"], update["render_bbox"])
             _set_region_geometry(region, update["ocr_bbox"])
             all_regions.append(region)
@@ -1718,8 +1808,9 @@ class CoreEngine:
             _set_region_geometry(region, getattr(region, "ocr_bbox", _region_bbox(region)))
         ctx.text_regions = enabled_regions
         if enabled_regions:
-            ctx.mask_raw = _make_mask_from_regions(payload["img_rgb"].shape, enabled_regions)
-            ctx.mask = await translator._run_mask_refinement(config, ctx)
+            ctx.mask = await _run_mask_refinement_by_region_offsets(
+                translator, config, payload["img_rgb"], enabled_regions
+            )
             ctx.img_inpainted = await translator._run_inpainting(config, ctx)
             clean_inpainted = _image_array_for_png(ctx.img_inpainted)
             if clean_inpainted is None:
@@ -1788,6 +1879,7 @@ async def rerender(
             _hex_rgb(update["outline"]),
         )
         region.enabled = update["enabled"]
+        _set_region_mask_dilation_offset(region, update["mask_dilation_offset"])
         _update_bbox_fields(region, update["ocr_bbox"], update["render_bbox"])
         _set_region_geometry(region, update["render_bbox"])
         _prepare_region_for_render(

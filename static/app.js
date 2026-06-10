@@ -13,6 +13,7 @@ const state = {
   activeRegion: null,
   editorMode: "ocr",
   dirtyOcrIndices: new Set(),
+  dirtyMaskIndices: new Set(),
   dragState: null,
   logsAutoFollow: true,
   serverStopping: false,
@@ -70,6 +71,8 @@ function setMutationControlsDisabled(disabled) {
     "toggleRegionButton",
     "reprocessButton",
     "rerenderButton",
+    "machineTranslateButton",
+    "ollamaTranslateButton",
     "saveSettings",
   ].forEach((id) => {
     const element = $(id);
@@ -216,6 +219,7 @@ async function createTask() {
     render_direction: $("initialDirection").value,
     render_alignment: $("initialAlignment").value,
     font_size: $("initialFontSize").value ? Number($("initialFontSize").value) : null,
+    mask_dilation_offset: updateMaskDilationLabel("globalMaskDilationOffset", "globalMaskDilationValue"),
   };
   const form = new FormData();
   form.append("config_json", JSON.stringify(config));
@@ -334,6 +338,19 @@ function normalizeOptionalFontSize(value) {
   return Math.round(parsed);
 }
 
+function normalizeMaskDilationOffset(value) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return 20;
+  return Math.max(0, Math.min(40, Math.round(parsed)));
+}
+
+function updateMaskDilationLabel(inputId, labelId) {
+  const value = normalizeMaskDilationOffset($(inputId).value);
+  $(inputId).value = value;
+  $(labelId).textContent = value;
+  return value;
+}
+
 function normalizeRegionAlignment(value) {
   return ["left", "center", "right"].includes(value) ? value : "left";
 }
@@ -352,6 +369,7 @@ function ensureRegionShape(region, index) {
   region.outline = region.outline || "#FFFFFF";
   region.text = region.text || "";
   region.translation = region.translation || "";
+  region.mask_dilation_offset = normalizeMaskDilationOffset(region.mask_dilation_offset);
   return region;
 }
 
@@ -384,6 +402,10 @@ function clampBBox(bbox) {
 
 function markOcrDirty(index) {
   state.dirtyOcrIndices.add(index);
+}
+
+function markMaskDirty(index) {
+  state.dirtyMaskIndices.add(index);
 }
 
 function setRegionBBox(region, bbox) {
@@ -452,6 +474,7 @@ async function openImage(image) {
   state.activeImage = image;
   state.activeRegion = null;
   state.dirtyOcrIndices.clear();
+  state.dirtyMaskIndices.clear();
   try {
     const data = await api(image.regions_url);
     state.regions = data.regions.map(ensureRegionShape);
@@ -593,6 +616,8 @@ function populateRegionForm(index) {
   $("regionAlignment").value = normalizeRegionAlignment(region.alignment);
   $("regionForeground").value = region.foreground;
   $("regionOutline").value = region.outline;
+  $("regionMaskDilationOffset").value = normalizeMaskDilationOffset(region.mask_dilation_offset);
+  updateMaskDilationLabel("regionMaskDilationOffset", "regionMaskDilationValue");
   $("toggleRegionButton").textContent = region.enabled ? "禁用区域" : "恢复区域";
   updateBBoxInputs(region);
   renderOverlays();
@@ -614,6 +639,7 @@ function syncActiveRegion() {
   region.alignment = $("regionAlignment").value;
   region.foreground = $("regionForeground").value;
   region.outline = $("regionOutline").value;
+  region.mask_dilation_offset = updateMaskDilationLabel("regionMaskDilationOffset", "regionMaskDilationValue");
   syncBoxInputs();
 }
 
@@ -649,8 +675,10 @@ function addRegion() {
     alignment: "left",
     foreground: "#000000",
     outline: "#FFFFFF",
+    mask_dilation_offset: updateMaskDilationLabel("globalMaskDilationOffset", "globalMaskDilationValue"),
   }, index));
   markOcrDirty(index);
+  markMaskDirty(index);
   loadEditorImage();
   selectRegion(index);
 }
@@ -664,6 +692,7 @@ function toggleRegion() {
   const region = state.regions[state.activeRegion];
   region.enabled = !region.enabled;
   markOcrDirty(region.index);
+  markMaskDirty(region.index);
   $("toggleRegionButton").textContent = region.enabled ? "禁用区域" : "恢复区域";
   renderOverlays();
 }
@@ -680,18 +709,25 @@ async function reprocessRegions() {
   }
   syncActiveRegion();
   const changed = [...state.dirtyOcrIndices].filter((index) => state.regions[index]);
-  if (!changed.length) {
-    $("editorMessage").textContent = "没有需要重新识别的 OCR 框";
+  const maskChanged = [...state.dirtyMaskIndices].filter((index) => state.regions[index]);
+  if (!changed.length && !maskChanged.length) {
+    $("editorMessage").textContent = "没有需要重新识别或重新去字的 OCR 框";
     return;
   }
   $("reprocessButton").disabled = true;
   $("rerenderButton").disabled = true;
-  $("editorMessage").textContent = "正在重新识别、翻译、去字并嵌字...";
+  $("editorMessage").textContent = changed.length
+    ? "正在重新识别、翻译、去字并嵌字..."
+    : "正在按新的去字范围重新处理并嵌字...";
   try {
     const data = await api(`/api/images/${state.activeImage.id}/reprocess-regions`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ regions: state.regions, changed_indices: changed }),
+      body: JSON.stringify({
+        regions: state.regions,
+        changed_indices: changed,
+        mask_changed_indices: maskChanged,
+      }),
     });
     state.regions = data.regions.map(ensureRegionShape);
     state.activeImage = {
@@ -702,6 +738,7 @@ async function reprocessRegions() {
       result_url: data.result_url || state.activeImage.result_url,
     };
     state.dirtyOcrIndices.clear();
+    state.dirtyMaskIndices.clear();
     if (state.activeRegion !== null && state.activeRegion >= state.regions.length) {
       state.activeRegion = state.regions.length ? state.regions.length - 1 : null;
     }
@@ -762,6 +799,46 @@ async function rerenderImage() {
     $("editorMessage").textContent = error.message;
   } finally {
     $("rerenderButton").disabled = state.serverStopping || state.serverStopped;
+  }
+}
+
+function setRegionTranslateButtonsDisabled(disabled) {
+  $("machineTranslateButton").disabled = disabled;
+  $("ollamaTranslateButton").disabled = disabled;
+}
+
+async function translateActiveRegion(mode) {
+  if (state.serverStopping || state.serverStopped) {
+    $("editorMessage").textContent = "服务已停止，重新启动后才能重新翻译";
+    return;
+  }
+  if (!state.activeImage || state.activeRegion === null) return;
+  if (!isImageEditable(state.activeImage)) {
+    $("editorMessage").textContent = "这张图片还在处理中，完成后即可重新翻译";
+    return;
+  }
+  syncActiveRegion();
+  const region = state.regions[state.activeRegion];
+  const text = (region.text || "").trim();
+  if (!text) {
+    $("editorMessage").textContent = "OCR 原文为空，无法翻译";
+    return;
+  }
+  setRegionTranslateButtonsDisabled(true);
+  $("editorMessage").textContent = mode === "machine" ? "正在调用机器翻译..." : "正在调用 Ollama 翻译...";
+  try {
+    const data = await api(`/api/images/${state.activeImage.id}/translate-region`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ mode, text }),
+    });
+    region.translation = data.translation || "";
+    $("regionTranslation").value = region.translation;
+    $("editorMessage").textContent = "译文已更新，确认后可保存校正并重新嵌字";
+  } catch (error) {
+    $("editorMessage").textContent = error.message;
+  } finally {
+    setRegionTranslateButtonsDisabled(state.serverStopping || state.serverStopped);
   }
 }
 
@@ -898,6 +975,19 @@ function bindEvents() {
   $("toggleRegionButton").onclick = toggleRegion;
   $("reprocessButton").onclick = reprocessRegions;
   $("rerenderButton").onclick = rerenderImage;
+  $("machineTranslateButton").onclick = () => translateActiveRegion("machine");
+  $("ollamaTranslateButton").onclick = () => translateActiveRegion("ollama");
+  $("globalMaskDilationOffset").oninput = () => {
+    updateMaskDilationLabel("globalMaskDilationOffset", "globalMaskDilationValue");
+  };
+  $("regionMaskDilationOffset").oninput = () => {
+    const value = updateMaskDilationLabel("regionMaskDilationOffset", "regionMaskDilationValue");
+    if (state.activeRegion === null) return;
+    const region = state.regions[state.activeRegion];
+    if (!region || region.mask_dilation_offset === value) return;
+    region.mask_dilation_offset = value;
+    markMaskDirty(region.index);
+  };
   $("clearLogView").onclick = () => {
     state.logs.clear();
     state.logsAutoFollow = true;
@@ -929,6 +1019,8 @@ function bindEvents() {
 
 async function init() {
   bindEvents();
+  updateMaskDilationLabel("globalMaskDilationOffset", "globalMaskDilationValue");
+  updateMaskDilationLabel("regionMaskDilationOffset", "regionMaskDilationValue");
   updateEditorPlaceholder();
   updateProviderFields();
   await Promise.all([loadHealth(), loadSettings(), loadTasks()]);

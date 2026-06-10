@@ -124,6 +124,14 @@
             <div id="fileSummary" class="file-summary">尚未选择图片</div>
           </div>
 
+          <label class="field slider-field">
+            <span class="label-row">
+              <span>全局去字范围</span>
+              <strong id="globalMaskDilationValue">20</strong>
+            </span>
+            <input id="globalMaskDilationOffset" type="range" min="0" max="40" value="20" />
+          </label>
+
           <button id="startButton" class="button primary full" type="button">开始翻译</button>
           <p id="formMessage" class="form-message"></p>
         </section>
@@ -211,8 +219,21 @@
                     <textarea id="regionText" rows="4"></textarea>
                   </label>
                   <label class="field">
-                    <span>译文</span>
+                    <span class="label-row">
+                      <span>译文</span>
+                      <span class="inline-actions">
+                        <button id="machineTranslateButton" class="button secondary mini" type="button">机器翻译</button>
+                        <button id="ollamaTranslateButton" class="button secondary mini" type="button">ollama翻译</button>
+                      </span>
+                    </span>
                     <textarea id="regionTranslation" rows="5"></textarea>
+                  </label>
+                  <label class="field slider-field">
+                    <span class="label-row">
+                      <span>去字范围</span>
+                      <strong id="regionMaskDilationValue">20</strong>
+                    </span>
+                    <input id="regionMaskDilationOffset" type="range" min="0" max="40" value="20" />
                   </label>
                   <div class="grid-two">
                     <label class="field">

@@ -120,6 +120,7 @@ def test_serialize_regions_includes_ocr_and_render_boxes():
     region.ocr_bbox = [1, 2, 3, 4]
     region.render_bbox = [5, 6, 7, 8]
     region.enabled = False
+    region.mask_dilation_offset = 13
 
     data = serialize_regions([region])
 
@@ -127,6 +128,146 @@ def test_serialize_regions_includes_ocr_and_render_boxes():
     assert data[0]["ocr_bbox"] == [1, 2, 3, 4]
     assert data[0]["render_bbox"] == [5, 6, 7, 8]
     assert data[0]["enabled"] is False
+    assert data[0]["mask_dilation_offset"] == 13
+
+
+def test_mask_refinement_groups_regions_by_dilation_offset():
+    image = np.zeros((4, 4, 3), dtype=np.uint8)
+    config = SimpleNamespace(mask_dilation_offset=20)
+    first = FakeRegion("a")
+    first.mask_dilation_offset = 13
+    second = FakeRegion("b")
+    second.mask_dilation_offset = 15
+    third = FakeRegion("c")
+    third.mask_dilation_offset = 13
+    calls = []
+
+    class FakeTranslator:
+        async def _run_mask_refinement(self, config, ctx):
+            calls.append(
+                (
+                    config.mask_dilation_offset,
+                    [region.translation for region in ctx.text_regions],
+                )
+            )
+            return np.full((4, 4), config.mask_dilation_offset, dtype=np.uint8)
+
+    mask = asyncio.run(
+        engine._run_mask_refinement_by_region_offsets(
+            FakeTranslator(), config, image, [first, second, third]
+        )
+    )
+
+    assert calls == [(13, ["a", "c"]), (15, ["b"])]
+    assert config.mask_dilation_offset == 20
+    assert np.all(mask == 255)
+
+
+def test_reprocess_mask_only_change_does_not_run_ocr(tmp_path, monkeypatch):
+    clean = np.zeros((4, 4, 3), dtype=np.uint8)
+    input_path = tmp_path / "input.png"
+    output_path = tmp_path / "output.png"
+    context_path = tmp_path / "context.pkl"
+    regions_path = tmp_path / "regions.json"
+    Image.fromarray(clean).save(input_path)
+
+    config = SimpleNamespace(
+        mask_dilation_offset=20,
+        translator=SimpleNamespace(target_lang="CHS"),
+        render=SimpleNamespace(no_hyphenation=True, line_spacing=None),
+    )
+    region = FakeRegion("old translation")
+    region.text = "old text"
+    region.ocr_bbox = [0, 0, 3, 3]
+    region.render_bbox = [0, 0, 3, 3]
+    region.mask_dilation_offset = 20
+    with context_path.open("wb") as file:
+        pickle.dump(
+            {
+                "config": config,
+                "text_regions": [region],
+                "img_rgb": clean.copy(),
+                "img_inpainted": clean.copy(),
+                "img_alpha": None,
+                "clean_image_trusted": True,
+            },
+            file,
+        )
+
+    mask_offsets = []
+
+    class FakeTranslator:
+        def add_progress_hook(self, _hook):
+            return None
+
+        async def _run_ocr(self, config, ctx):
+            raise AssertionError("OCR should not run for mask-only changes")
+
+        async def _run_mask_refinement(self, config, ctx):
+            mask_offsets.append(config.mask_dilation_offset)
+            return np.ones((4, 4), dtype=np.uint8) * 255
+
+        async def _run_inpainting(self, config, ctx):
+            return clean + 1
+
+        async def _run_text_rendering(self, config, ctx):
+            assert ctx.text_regions[0].text == "old text"
+            assert ctx.text_regions[0].translation == "old translation"
+            return clean + 2
+
+    monkeypatch.setattr(engine, "_mps_available", lambda: False)
+    monkeypatch.setattr(
+        engine,
+        "_load_text_render",
+        lambda: SimpleNamespace(
+            calc_horizontal=lambda font_size, text, width, height, lang, hyphenate: (
+                [text],
+                [min(width, font_size)],
+            ),
+            calc_vertical=lambda font_size, text, height: ([text], [min(height, font_size)]),
+        ),
+    )
+    monkeypatch.setattr(
+        engine.CoreEngine,
+        "_build",
+        lambda self, use_gpu: (
+            {"dump_image": lambda base_image, rendered, alpha: Image.fromarray(rendered)},
+            FakeTranslator(),
+        ),
+    )
+    monkeypatch.setattr(engine.CoreEngine, "_config", lambda self, core, use_gpu: config)
+
+    runner = engine.CoreEngine(
+        DummyProvider({"old text": "new translation"}),
+        "ja",
+        "zh-CN",
+        None,
+        "auto",
+        "auto",
+        None,
+        lambda *_args, **_kwargs: asyncio.sleep(0),
+        lambda *_args, **_kwargs: asyncio.sleep(0),
+    )
+    updates = serialize_regions([region])
+    updates[0]["mask_dilation_offset"] = 13
+
+    regions = asyncio.run(
+        runner.reprocess_regions(
+            input_path,
+            output_path,
+            context_path,
+            regions_path,
+            updates,
+            [],
+            [0],
+        )
+    )
+
+    assert mask_offsets == [13]
+    assert regions[0]["text"] == "old text"
+    assert regions[0]["translation"] == "old translation"
+    assert regions[0]["mask_dilation_offset"] == 13
+    assert np.array_equal(np.array(Image.open(output_path)), clean + 2)
 
 
 def test_fit_region_font_size_shrinks_to_render_box(monkeypatch):

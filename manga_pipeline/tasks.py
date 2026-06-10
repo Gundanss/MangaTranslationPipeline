@@ -56,6 +56,7 @@ class TaskManager:
             font_size=config.get("font_size"),
             progress_callback=progress_callback,
             log_callback=log_callback,
+            mask_dilation_offset=config.get("mask_dilation_offset", 20),
         )
 
     async def enqueue(self, task_id: str) -> None:
@@ -372,6 +373,7 @@ class TaskManager:
         image: dict[str, Any],
         updates: list[dict[str, Any]],
         changed_indices: list[int],
+        mask_changed_indices: list[int] | None = None,
     ) -> list[dict[str, Any]]:
         task = self.database.get_task(image["task_id"])
         if not task:
@@ -409,6 +411,7 @@ class TaskManager:
                         Path(image["regions_path"]),
                         updates,
                         changed_indices,
+                        mask_changed_indices or [],
                     )
                     self.database.update_image(
                         image["id"], status="completed", stage="saved", progress=1.0

@@ -3,7 +3,7 @@ from pathlib import Path
 import pytest
 
 from manga_pipeline.config import safe_name, safe_relative_path
-from manga_pipeline.schemas import TaskConfig
+from manga_pipeline.schemas import RegionUpdate, TaskConfig
 
 
 def test_safe_relative_path_preserves_folder_structure():
@@ -36,3 +36,48 @@ def test_task_config_contains_initial_typesetting_options():
     assert config.render_direction == "vertical"
     assert config.render_alignment == "center"
     assert config.font_size == 28
+
+
+def test_mask_dilation_defaults_and_bounds():
+    config = TaskConfig(source_language="ja", ollama_model="model")
+    assert config.mask_dilation_offset == 20
+
+    assert (
+        TaskConfig(
+            source_language="ja",
+            ollama_model="model",
+            mask_dilation_offset=0,
+        ).mask_dilation_offset
+        == 0
+    )
+    assert (
+        TaskConfig(
+            source_language="ja",
+            ollama_model="model",
+            mask_dilation_offset=40,
+        ).mask_dilation_offset
+        == 40
+    )
+    with pytest.raises(ValueError):
+        TaskConfig(source_language="ja", ollama_model="model", mask_dilation_offset=-1)
+    with pytest.raises(ValueError):
+        TaskConfig(source_language="ja", ollama_model="model", mask_dilation_offset=41)
+
+
+def test_region_update_mask_dilation_defaults_and_bounds():
+    base = {
+        "index": 0,
+        "bbox": [0, 0, 10, 10],
+        "enabled": True,
+        "text": "原文",
+        "translation": "译文",
+        "foreground": "#000000",
+        "outline": "#FFFFFF",
+    }
+    assert RegionUpdate(**base).mask_dilation_offset == 20
+    assert RegionUpdate(**{**base, "mask_dilation_offset": 0}).mask_dilation_offset == 0
+    assert RegionUpdate(**{**base, "mask_dilation_offset": 40}).mask_dilation_offset == 40
+    with pytest.raises(ValueError):
+        RegionUpdate(**{**base, "mask_dilation_offset": -1})
+    with pytest.raises(ValueError):
+        RegionUpdate(**{**base, "mask_dilation_offset": 41})

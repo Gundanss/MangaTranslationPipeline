@@ -37,7 +37,13 @@ from .providers import (
     list_ollama_models,
     sanitize_translation_text,
 )
-from .schemas import ReprocessRegionsRequest, RerenderRequest, SettingsUpdate, TaskConfig
+from .schemas import (
+    ReprocessRegionsRequest,
+    RerenderRequest,
+    SettingsUpdate,
+    TaskConfig,
+    TranslateRegionRequest,
+)
 from .secret_store import SecretStore
 from .tasks import TaskManager
 
@@ -115,6 +121,9 @@ def _normalize_region_json(regions: list[dict]) -> tuple[list[dict], bool]:
             changed = True
         if "enabled" not in item:
             item["enabled"] = True
+            changed = True
+        if "mask_dilation_offset" not in item:
+            item["mask_dilation_offset"] = 20
             changed = True
         cleaned = sanitize_translation_text(item.get("translation", ""))
         if cleaned != item.get("translation", ""):
@@ -413,6 +422,7 @@ async def reprocess_regions(image_id: str, request: ReprocessRegionsRequest):
             image,
             [region.model_dump() for region in request.regions],
             request.changed_indices,
+            request.mask_changed_indices,
         )
     except Exception as exc:
         database.log(
@@ -435,6 +445,86 @@ async def reprocess_regions(image_id: str, request: ReprocessRegionsRequest):
         "regions": regions,
         "result_url": f"/api/images/{image_id}/file/result",
     }
+
+
+@app.post("/api/images/{image_id}/translate-region")
+async def translate_region(image_id: str, request: TranslateRegionRequest):
+    _ensure_service_writable()
+    image = database.get_image(image_id)
+    if not image:
+        raise HTTPException(status_code=404, detail="图片不存在")
+    task = database.get_task(image["task_id"])
+    if not task:
+        raise HTTPException(status_code=404, detail="图片所属任务不存在")
+
+    text = request.text.strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="OCR 原文为空，无法翻译")
+
+    config = task["config"]
+    settings = secrets.get()
+    if request.mode == "machine":
+        provider_name = config.get("provider")
+        if provider_name == "ollama":
+            raise HTTPException(
+                status_code=400,
+                detail="当前任务使用的是 Ollama；机器翻译只复用 Google 或 Bing/Microsoft 在线配置",
+            )
+        provider = create_provider(provider_name, settings, None)
+        label = "机器翻译"
+    else:
+        model = (
+            config.get("ollama_model")
+            or config.get("polish_model")
+            or settings.get("last_ollama_model")
+        )
+        if not model:
+            raise HTTPException(
+                status_code=400,
+                detail="没有可用的 Ollama 模型，请先在任务或本机设置中选择模型",
+            )
+        provider = create_provider("ollama", settings, model)
+        label = "Ollama 翻译"
+
+    async def log(level: str, stage: str, message: str, details: dict | None):
+        database.log(
+            image["task_id"],
+            level,
+            stage,
+            message,
+            image_id=image_id,
+            details=details,
+        )
+
+    provider.set_log_callback(log)
+    try:
+        translations = await provider.translate(
+            [text],
+            config["source_language"],
+            config["target_language"],
+        )
+    except TranslationError as exc:
+        database.log(
+            image["task_id"],
+            "ERROR",
+            "translation",
+            f"{label}失败：{exc}",
+            image_id=image_id,
+        )
+        raise HTTPException(status_code=502, detail=f"{label}失败：{exc}") from exc
+
+    translation = sanitize_translation_text(translations[0] if translations else "")
+    if not translation:
+        raise HTTPException(status_code=502, detail=f"{label}返回了空译文")
+    database.log(
+        image["task_id"],
+        "INFO",
+        "translation",
+        f"{label}完成：区域译文已更新到编辑框",
+        image_id=image_id,
+        details={"pairs": [{"source": text, "translation": translation}]},
+    )
+    return {"ok": True, "translation": translation}
 
 
 @app.exception_handler(Exception)

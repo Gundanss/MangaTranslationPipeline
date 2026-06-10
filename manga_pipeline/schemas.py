@@ -9,6 +9,7 @@ TargetLanguage = Literal["zh-CN", "zh-TW", "en", "ja", "ko"]
 ProviderName = Literal["ollama", "google", "microsoft"]
 TextDirection = Literal["auto", "horizontal", "vertical"]
 TextAlignment = Literal["auto", "left", "center", "right"]
+TranslateRegionMode = Literal["machine", "ollama"]
 BBox = Annotated[list[int], Field(min_length=4, max_length=4)]
 
 
@@ -23,6 +24,7 @@ class TaskConfig(BaseModel):
     render_direction: TextDirection = "auto"
     render_alignment: TextAlignment = "auto"
     font_size: int | None = Field(default=None, ge=6, le=300)
+    mask_dilation_offset: int = Field(default=20, ge=0, le=40)
 
     @field_validator("ollama_model")
     @classmethod
@@ -54,6 +56,7 @@ class RegionUpdate(BaseModel):
     alignment: TextAlignment = "left"
     foreground: str = Field(pattern=r"^#[0-9A-Fa-f]{6}$")
     outline: str = Field(pattern=r"^#[0-9A-Fa-f]{6}$")
+    mask_dilation_offset: int = Field(default=20, ge=0, le=40)
 
 
 class RerenderRequest(BaseModel):
@@ -63,3 +66,9 @@ class RerenderRequest(BaseModel):
 class ReprocessRegionsRequest(BaseModel):
     regions: list[RegionUpdate]
     changed_indices: list[int] = Field(default_factory=list)
+    mask_changed_indices: list[int] = Field(default_factory=list)
+
+
+class TranslateRegionRequest(BaseModel):
+    mode: TranslateRegionMode
+    text: str = Field(min_length=1)
