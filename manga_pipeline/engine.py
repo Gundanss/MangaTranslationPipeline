@@ -965,6 +965,193 @@ class CoreEngine:
             filtered.append(line)
         return self._sort_manual_ocr_items(filtered)
 
+    def _manual_ocr_tight_text_bbox(
+        self, image: np.ndarray, bbox: list[int]
+    ) -> list[int] | None:
+        height, width = image.shape[:2]
+        x1, y1, x2, y2 = _clip_bbox(bbox, width, height)
+        box_width = x2 - x1
+        box_height = y2 - y1
+        if box_height < 32 or box_height / max(1, box_width) < 1.8:
+            return None
+
+        crop = image[y1:y2, x1:x2]
+        if crop.size == 0:
+            return None
+        if crop.ndim == 2:
+            gray = crop
+            saturation = np.zeros_like(gray)
+            value = gray
+        else:
+            rgb = crop[:, :, :3]
+            gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+            hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
+            saturation = hsv[:, :, 1]
+            value = hsv[:, :, 2]
+
+        dark = gray < 190
+        colored = (saturation > 45) & (value < 250)
+        mask = (dark | colored).astype(np.uint8) * 255
+        mask = cv2.morphologyEx(
+            mask, cv2.MORPH_OPEN, np.ones((2, 2), dtype=np.uint8)
+        )
+        count, _labels, stats, _centroids = cv2.connectedComponentsWithStats(mask, 8)
+        accepted: list[tuple[int, int, int, int]] = []
+        min_area = max(3, int(box_width * box_height * 0.0002))
+        for label in range(1, count):
+            cx, cy, cw, ch, area = [int(value) for value in stats[label]]
+            if area < min_area:
+                continue
+            if cw >= box_width * 0.9 and ch >= box_height * 0.9:
+                continue
+            accepted.append((cx, cy, cx + cw, cy + ch))
+        if not accepted:
+            return None
+
+        tx1 = min(item[0] for item in accepted)
+        ty1 = min(item[1] for item in accepted)
+        tx2 = max(item[2] for item in accepted)
+        ty2 = max(item[3] for item in accepted)
+        tight_width = tx2 - tx1
+        tight_height = ty2 - ty1
+        if tight_width < 2 or tight_height < 8:
+            return None
+        if tight_width * tight_height > box_width * box_height * 0.85:
+            return None
+
+        pad_x = max(3, int(round(tight_width * 0.2)))
+        pad_y = max(3, int(round(tight_height * 0.04)))
+        return _clip_bbox(
+            [
+                x1 + tx1 - pad_x,
+                y1 + ty1 - pad_y,
+                x1 + tx2 + pad_x,
+                y1 + ty2 + pad_y,
+            ],
+            width,
+            height,
+        )
+
+    def _manual_ocr_vertical_column_bboxes(
+        self, image: np.ndarray, bbox: list[int]
+    ) -> list[list[int]]:
+        if self.source_language != "ja":
+            return []
+        height, width = image.shape[:2]
+        x1, y1, x2, y2 = _clip_bbox(bbox, width, height)
+        box_width = x2 - x1
+        box_height = y2 - y1
+        if box_height < 48 or box_height / max(1, box_width) < 1.6:
+            return []
+
+        crop = image[y1:y2, x1:x2]
+        if crop.size == 0:
+            return []
+        if crop.ndim == 2:
+            gray = crop
+            saturation = np.zeros_like(gray)
+            value = gray
+        else:
+            rgb = crop[:, :, :3]
+            gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+            hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
+            saturation = hsv[:, :, 1]
+            value = hsv[:, :, 2]
+
+        mask = ((gray < 190) | ((saturation > 45) & (value < 250))).astype(np.uint8)
+        mask = cv2.morphologyEx(
+            mask * 255, cv2.MORPH_OPEN, np.ones((2, 2), dtype=np.uint8)
+        )
+        count, _labels, stats, centroids = cv2.connectedComponentsWithStats(mask, 8)
+        components: list[tuple[int, int, int, int, float, float, int]] = []
+        min_area = max(16, int(box_width * box_height * 0.00015))
+        for label in range(1, count):
+            cx, cy, cw, ch, area = [int(value) for value in stats[label]]
+            if area < min_area:
+                continue
+            if cw > box_width * 0.55 or ch > box_height * 0.3:
+                continue
+            if (
+                cx <= 1
+                or cy <= 1
+                or cx + cw >= box_width - 1
+                or cy + ch >= box_height - 1
+            ):
+                continue
+            center_x, center_y = [float(value) for value in centroids[label]]
+            components.append((cx, cy, cx + cw, cy + ch, center_x, center_y, area))
+        if not components:
+            return []
+
+        widths = [right - left for left, _top, right, _bottom, *_rest in components]
+        median_width = float(np.median(widths)) if widths else 0.0
+        column_tolerance = max(28.0, median_width * 1.4, box_width * 0.16)
+        columns: list[list[tuple[int, int, int, int, float, float, int]]] = []
+        for component in sorted(components, key=lambda item: item[4], reverse=True):
+            for column in columns:
+                mean_x = sum(item[4] for item in column) / len(column)
+                if abs(component[4] - mean_x) <= column_tolerance:
+                    column.append(component)
+                    break
+            else:
+                columns.append([component])
+
+        bboxes: list[list[int]] = []
+        for column in columns:
+            if len(column) < 2:
+                continue
+            left = min(item[0] for item in column)
+            top = min(item[1] for item in column)
+            right = max(item[2] for item in column)
+            bottom = max(item[3] for item in column)
+            col_width = right - left
+            col_height = bottom - top
+            col_area = sum(item[6] for item in column)
+            if col_height < max(24, box_height * 0.18):
+                continue
+            if col_area < box_width * box_height * 0.006:
+                continue
+            pad_x = max(4, int(round(col_width * 0.25)))
+            pad_y = max(4, int(round(col_height * 0.04)))
+            bboxes.append(
+                _clip_bbox(
+                    [
+                        x1 + left - pad_x,
+                        y1 + top - pad_y,
+                        x1 + right + pad_x,
+                        y1 + bottom + pad_y,
+                    ],
+                    width,
+                    height,
+                )
+            )
+
+        return sorted(bboxes, key=lambda item: -((item[0] + item[2]) / 2))
+
+    def _manual_ocr_text_from_items(self, items: list[Any]) -> str:
+        return self._join_manual_ocr_texts(
+            [getattr(item, "text", "") for item in self._sort_manual_ocr_items(items)]
+        )
+
+    def _manual_ocr_should_prefer_columns(
+        self, column_items: list[Any], current_items: list[Any]
+    ) -> bool:
+        if not column_items:
+            return False
+        if not current_items:
+            return True
+        column_text = self._manual_ocr_text_from_items(column_items)
+        current_text = self._manual_ocr_text_from_items(current_items)
+        column_score = self._manual_ocr_text_value(column_text)
+        current_score = self._manual_ocr_text_value(current_text)
+        if column_score >= current_score + max(2, int(current_score * 0.25)):
+            return True
+        if re.search(r"[A-Za-z]{2,}", current_text) and column_score >= current_score - 1:
+            return True
+        if len(column_items) > len(current_items) and column_score >= current_score:
+            return True
+        return False
+
     async def _log_manual_ocr_source(
         self, source: str, text: str, old_text: str | None = None
     ) -> None:
@@ -1046,7 +1233,57 @@ class CoreEngine:
 
         crop_ctx.textlines = detected_textlines
         ocr_textlines = await translator._run_ocr(config, crop_ctx) if detected_textlines else []
-        single_box_used = False
+        ocr_textlines = [line for line in ocr_textlines if getattr(line, "text", "").strip()]
+        ocr_source = "框内检测"
+        column_bboxes = self._manual_ocr_vertical_column_bboxes(image, [x1, y1, x2, y2])
+        if column_bboxes:
+            crop_ctx.textlines = [
+                core["Quadrilateral"](
+                    _bbox_to_polygon(
+                        [
+                            bx1 - crop_x1,
+                            by1 - crop_y1,
+                            bx2 - crop_x1,
+                            by2 - crop_y1,
+                        ]
+                    ),
+                    "",
+                    1,
+                )
+                for bx1, by1, bx2, by2 in column_bboxes
+            ]
+            column_textlines = await translator._run_ocr(config, crop_ctx)
+            column_textlines = [
+                line
+                for line in column_textlines
+                if getattr(line, "text", "").strip()
+            ]
+            if self._manual_ocr_should_prefer_columns(column_textlines, ocr_textlines):
+                ocr_textlines = column_textlines
+                ocr_source = "竖排列切分"
+        if not ocr_textlines:
+            tight_bbox = self._manual_ocr_tight_text_bbox(image, [x1, y1, x2, y2])
+            if tight_bbox is not None:
+                tx1, ty1, tx2, ty2 = tight_bbox
+                crop_ctx.textlines = [
+                    core["Quadrilateral"](
+                        _bbox_to_polygon(
+                            [
+                                tx1 - crop_x1,
+                                ty1 - crop_y1,
+                                tx2 - crop_x1,
+                                ty2 - crop_y1,
+                            ]
+                        ),
+                        "",
+                        1,
+                    )
+                ]
+                ocr_textlines = await translator._run_ocr(config, crop_ctx)
+                ocr_textlines = [
+                    line for line in ocr_textlines if getattr(line, "text", "").strip()
+                ]
+                ocr_source = "墨迹收紧"
         if not ocr_textlines:
             crop_ctx.textlines = [
                 core["Quadrilateral"](
@@ -1056,9 +1293,9 @@ class CoreEngine:
                 )
             ]
             ocr_textlines = await translator._run_ocr(config, crop_ctx)
-            single_box_used = True
+            ocr_textlines = [line for line in ocr_textlines if getattr(line, "text", "").strip()]
+            ocr_source = "单框兜底"
 
-        ocr_textlines = [line for line in ocr_textlines if getattr(line, "text", "").strip()]
         if not ocr_textlines:
             if old_text and old_text.strip():
                 await self._log_manual_ocr_source("复用旧文本", old_text, old_text)
@@ -1081,7 +1318,7 @@ class CoreEngine:
             if self._manual_ocr_is_low_quality(text, old_text):
                 await self._log_manual_ocr_source("复用旧文本", old_text or "", old_text)
                 return (old_text or "").strip(), colors
-            await self._log_manual_ocr_source("单框兜底" if single_box_used else "框内检测", text, old_text)
+            await self._log_manual_ocr_source(ocr_source, text, old_text)
             return text, colors
 
         merge_textlines = self._sort_manual_ocr_items(merge_textlines)
@@ -1107,7 +1344,7 @@ class CoreEngine:
             if self._manual_ocr_is_low_quality(text, old_text):
                 await self._log_manual_ocr_source("复用旧文本", old_text or "", old_text)
                 return (old_text or "").strip(), colors
-            await self._log_manual_ocr_source("框内检测", text, old_text)
+            await self._log_manual_ocr_source(ocr_source, text, old_text)
             return text, colors
 
         color_source = merge_textlines[0]
@@ -1121,7 +1358,7 @@ class CoreEngine:
         if self._manual_ocr_is_low_quality(text, old_text):
             await self._log_manual_ocr_source("复用旧文本", old_text or "", old_text)
             return (old_text or "").strip(), colors
-        await self._log_manual_ocr_source("单框兜底" if single_box_used else "框内检测", text, old_text)
+        await self._log_manual_ocr_source(ocr_source, text, old_text)
         return text, colors
 
     async def _translate_manual_texts(self, texts: list[str]) -> list[str]:

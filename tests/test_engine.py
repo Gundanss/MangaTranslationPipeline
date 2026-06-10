@@ -997,6 +997,126 @@ def test_reprocess_multiple_manual_boxes_fallback_uses_each_old_text(
     assert np.array_equal(np.array(Image.open(output_path)), clean + 11)
 
 
+def test_manual_ocr_tightens_vertical_box_before_single_box_fallback():
+    clean = np.full((40, 30, 3), 255, dtype=np.uint8)
+    for y in range(6, 30, 5):
+        clean[y : y + 3, 10:14] = [230, 20, 20]
+    full_local_bbox = [4, 2, 20, 34]
+    seen_bboxes = []
+
+    class FakeQuadrilateral:
+        def __init__(self, polygon, text, prob, *colors):
+            self.pts = np.array(polygon)
+            points = self.pts.reshape(-1, 2)
+            self.xyxy = [
+                int(points[:, 0].min()),
+                int(points[:, 1].min()),
+                int(points[:, 0].max()),
+                int(points[:, 1].max()),
+            ]
+            self.text = text
+            self.prob = prob
+            self.fg_colors = np.array(colors[:3] or (10, 20, 30))
+            self.bg_colors = np.array(colors[3:6] or (240, 240, 240))
+
+    class FakeTranslator:
+        async def _run_detection(self, config, ctx):
+            return [], None, None
+
+        async def _run_ocr(self, config, ctx):
+            bbox = list(ctx.textlines[0].xyxy)
+            seen_bboxes.append(bbox)
+            ctx.textlines[0].text = (
+                "ルな点数また"
+                if bbox == full_local_bbox
+                else "またこんな点数とったわねーっ?"
+            )
+            return ctx.textlines
+
+    runner = engine.CoreEngine(
+        DummyProvider({}),
+        "ja",
+        "zh-CN",
+        None,
+        "auto",
+        "auto",
+        None,
+        lambda *_args, **_kwargs: asyncio.sleep(0),
+        lambda *_args, **_kwargs: asyncio.sleep(0),
+    )
+
+    text, colors = asyncio.run(
+        runner._ocr_user_bbox(
+            {"Quadrilateral": FakeQuadrilateral},
+            FakeTranslator(),
+            SimpleNamespace(),
+            clean,
+            [4, 2, 20, 34],
+        )
+    )
+
+    assert text == "またこんな点数とったわねーっ?"
+    assert len(seen_bboxes) == 1
+    assert seen_bboxes[0] != full_local_bbox
+    assert (
+        seen_bboxes[0][2] - seen_bboxes[0][0]
+        < full_local_bbox[2] - full_local_bbox[0]
+    )
+    assert [value.tolist() for value in colors] == [[10, 20, 30], [240, 240, 240]]
+
+
+def test_manual_ocr_rejects_partial_score_text_from_adjusted_box():
+    clean = np.zeros((16, 16, 3), dtype=np.uint8)
+
+    class FakeQuadrilateral:
+        def __init__(self, polygon, text, prob):
+            points = np.array(polygon).reshape(-1, 2)
+            self.xyxy = [
+                int(points[:, 0].min()),
+                int(points[:, 1].min()),
+                int(points[:, 0].max()),
+                int(points[:, 1].max()),
+            ]
+            self.text = text
+            self.prob = prob
+            self.fg_colors = (10, 20, 30)
+            self.bg_colors = (240, 240, 240)
+
+    class FakeTranslator:
+        async def _run_detection(self, config, ctx):
+            return [], None, None
+
+        async def _run_ocr(self, config, ctx):
+            ctx.textlines[0].text = "ルな点数また"
+            return ctx.textlines
+
+    runner = engine.CoreEngine(
+        DummyProvider({}),
+        "ja",
+        "zh-CN",
+        None,
+        "auto",
+        "auto",
+        None,
+        lambda *_args, **_kwargs: asyncio.sleep(0),
+        lambda *_args, **_kwargs: asyncio.sleep(0),
+    )
+
+    text, colors = asyncio.run(
+        runner._ocr_user_bbox(
+            {"Quadrilateral": FakeQuadrilateral},
+            FakeTranslator(),
+            SimpleNamespace(),
+            clean,
+            [2, 2, 10, 14],
+            "またこんな点数とったわねーっ?",
+        )
+    )
+
+    assert text == "またこんな点数とったわねーっ?"
+    assert colors == ((10, 20, 30), (240, 240, 240))
+
+
 def test_manual_ocr_quality_rejects_japanese_text_with_many_missing_chars():
     runner = engine.CoreEngine(
         DummyProvider({}),
