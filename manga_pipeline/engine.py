@@ -6,6 +6,7 @@ import inspect
 import json
 import os
 import pickle
+import re
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -876,6 +877,107 @@ class CoreEngine:
             return "".join(cleaned)
         return " ".join(cleaned)
 
+    def _manual_ocr_text_value(self, text: str) -> int:
+        return len(re.sub(r"[\s　、。,.!?！？…:：;；「」『』（）()【】\[\]<>/\\|_-]", "", text or ""))
+
+    def _manual_ocr_text_units(self, text: str) -> list[str]:
+        cleaned = re.sub(r"[\s　、。,.!?！？…:：;；「」『』（）()【】\[\]<>/\\|_-]", "", text or "")
+        return [char for char in cleaned if char]
+
+    def _manual_ocr_char_recall(self, new_text: str, old_text: str) -> float:
+        old_units = self._manual_ocr_text_units(old_text)
+        new_units = self._manual_ocr_text_units(new_text)
+        if not old_units or not new_units:
+            return 1.0 if old_units == new_units else 0.0
+        remaining: dict[str, int] = {}
+        for char in new_units:
+            remaining[char] = remaining.get(char, 0) + 1
+        matched = 0
+        for char in old_units:
+            count = remaining.get(char, 0)
+            if count:
+                matched += 1
+                remaining[char] = count - 1
+        return matched / len(old_units)
+
+    def _manual_ocr_is_low_quality(self, new_text: str, old_text: str | None) -> bool:
+        old_clean = (old_text or "").strip()
+        if not old_clean:
+            return False
+        new_clean = (new_text or "").strip()
+        if not new_clean:
+            return True
+        if any(marker in new_clean for marker in ("<", ">", "�")):
+            return True
+        old_score = self._manual_ocr_text_value(old_clean)
+        new_score = self._manual_ocr_text_value(new_clean)
+        if old_score >= 4 and new_score < max(2, int(old_score * 0.55)):
+            return True
+        if self.source_language == "ja" and old_score >= 8:
+            recall = self._manual_ocr_char_recall(new_clean, old_clean)
+            if recall < 0.68 and new_score <= int(old_score * 1.25):
+                return True
+        return False
+
+    def _textline_center(self, textline: Any) -> tuple[float, float]:
+        if hasattr(textline, "pts"):
+            points = np.asarray(textline.pts, dtype=np.float32).reshape(-1, 2)
+            return float(points[:, 0].mean()), float(points[:, 1].mean())
+        center = getattr(textline, "center", None)
+        if center is not None:
+            return float(center[0]), float(center[1])
+        xyxy = getattr(textline, "xyxy", [0, 0, 0, 0])
+        return (float(xyxy[0] + xyxy[2]) / 2, float(xyxy[1] + xyxy[3]) / 2)
+
+    def _textline_area(self, textline: Any) -> float:
+        if hasattr(textline, "pts"):
+            points = np.asarray(textline.pts, dtype=np.float32).reshape(-1, 2)
+            return float(max(1.0, cv2.contourArea(points)))
+        xyxy = getattr(textline, "xyxy", [0, 0, 0, 0])
+        return float(max(1.0, (xyxy[2] - xyxy[0]) * (xyxy[3] - xyxy[1])))
+
+    def _sort_manual_ocr_items(self, items: list[Any]) -> list[Any]:
+        if self.source_language == "ja":
+            return sorted(items, key=lambda item: (-self._textline_center(item)[0], self._textline_center(item)[1]))
+        return sorted(items, key=lambda item: (self._textline_center(item)[1], self._textline_center(item)[0]))
+
+    def _filter_detected_textlines_in_user_bbox(
+        self,
+        textlines: list[Any],
+        user_bbox: list[int],
+        crop_origin: tuple[int, int],
+        image_shape: tuple[int, ...],
+    ) -> list[Any]:
+        if not textlines:
+            return []
+        ux1, uy1, ux2, uy2 = user_bbox
+        crop_x, crop_y = crop_origin
+        image_area = max(1, image_shape[0] * image_shape[1])
+        filtered: list[Any] = []
+        for line in textlines:
+            cx, cy = self._textline_center(line)
+            gx = cx + crop_x
+            gy = cy + crop_y
+            if not (ux1 <= gx <= ux2 and uy1 <= gy <= uy2):
+                continue
+            if self._textline_area(line) / image_area > 0.85:
+                continue
+            filtered.append(line)
+        return self._sort_manual_ocr_items(filtered)
+
+    async def _log_manual_ocr_source(
+        self, source: str, text: str, old_text: str | None = None
+    ) -> None:
+        details: dict[str, Any] = {"texts": [text]} if text else {}
+        if old_text:
+            details["old_text"] = old_text
+        await self.log_callback(
+            "INFO",
+            "ocr",
+            f"人工 OCR 使用{source}",
+            details or None,
+        )
+
     def _offset_textline(self, core: dict[str, Any], textline: Any, x: int, y: int) -> Any:
         if not hasattr(textline, "pts"):
             return textline
@@ -908,9 +1010,15 @@ class CoreEngine:
         config: Any,
         image: np.ndarray,
         bbox: list[int],
+        old_text: str | None = None,
     ) -> tuple[str, tuple[Any, Any] | None]:
-        x1, y1, x2, y2 = bbox
-        crop = np.ascontiguousarray(image[y1:y2, x1:x2])
+        height, width = image.shape[:2]
+        x1, y1, x2, y2 = _clip_bbox(bbox, width, height)
+        pad = max(4, int(round(max(x2 - x1, y2 - y1) * 0.04)))
+        crop_x1, crop_y1, crop_x2, crop_y2 = _clip_bbox(
+            [x1 - pad, y1 - pad, x2 + pad, y2 + pad], width, height
+        )
+        crop = np.ascontiguousarray(image[crop_y1:crop_y2, crop_x1:crop_x2])
         crop_height, crop_width = crop.shape[:2]
         crop_ctx = SimpleNamespace(
             img_rgb=crop,
@@ -929,39 +1037,54 @@ class CoreEngine:
                 None,
             )
         detected_textlines = detected_textlines or []
+        detected_textlines = self._filter_detected_textlines_in_user_bbox(
+            detected_textlines,
+            [x1, y1, x2, y2],
+            (crop_x1, crop_y1),
+            crop.shape,
+        )
 
         crop_ctx.textlines = detected_textlines
         ocr_textlines = await translator._run_ocr(config, crop_ctx) if detected_textlines else []
+        single_box_used = False
         if not ocr_textlines:
             crop_ctx.textlines = [
                 core["Quadrilateral"](
-                    _bbox_to_polygon([0, 0, crop_width, crop_height]),
+                    _bbox_to_polygon([x1 - crop_x1, y1 - crop_y1, x2 - crop_x1, y2 - crop_y1]),
                     "",
                     1,
                 )
             ]
             ocr_textlines = await translator._run_ocr(config, crop_ctx)
+            single_box_used = True
 
         ocr_textlines = [line for line in ocr_textlines if getattr(line, "text", "").strip()]
         if not ocr_textlines:
+            if old_text and old_text.strip():
+                await self._log_manual_ocr_source("复用旧文本", old_text, old_text)
+                return old_text.strip(), None
             return "", None
 
         global_textlines = [
-            self._offset_textline(core, line, x1, y1) for line in ocr_textlines
+            self._offset_textline(core, line, crop_x1, crop_y1) for line in ocr_textlines
         ]
         merge_textlines = [line for line in global_textlines if hasattr(line, "pts")]
         if not merge_textlines:
             color_source = ocr_textlines[0]
-            return (
-                self._join_manual_ocr_texts(
-                    [getattr(line, "text", "") for line in ocr_textlines]
-                ),
-                (
-                    getattr(color_source, "fg_colors", (0, 0, 0)),
-                    getattr(color_source, "bg_colors", (255, 255, 255)),
-                ),
+            text = self._join_manual_ocr_texts(
+                [getattr(line, "text", "") for line in self._sort_manual_ocr_items(ocr_textlines)]
             )
+            colors = (
+                getattr(color_source, "fg_colors", (0, 0, 0)),
+                getattr(color_source, "bg_colors", (255, 255, 255)),
+            )
+            if self._manual_ocr_is_low_quality(text, old_text):
+                await self._log_manual_ocr_source("复用旧文本", old_text or "", old_text)
+                return (old_text or "").strip(), colors
+            await self._log_manual_ocr_source("单框兜底" if single_box_used else "框内检测", text, old_text)
+            return text, colors
 
+        merge_textlines = self._sort_manual_ocr_items(merge_textlines)
         merge_ctx = SimpleNamespace(textlines=merge_textlines, img_rgb=image)
         try:
             merged_regions = await translator._run_textline_merge(config, merge_ctx)
@@ -975,24 +1098,31 @@ class CoreEngine:
             merged_regions = []
 
         if merged_regions:
+            merged_regions = self._sort_manual_ocr_items(merged_regions)
             color_source = merged_regions[0]
-            return (
-                self._join_manual_ocr_texts(
-                    [getattr(region, "text", "") for region in merged_regions]
-                ),
-                color_source.get_font_colors(),
+            text = self._join_manual_ocr_texts(
+                [getattr(region, "text", "") for region in merged_regions]
             )
+            colors = color_source.get_font_colors()
+            if self._manual_ocr_is_low_quality(text, old_text):
+                await self._log_manual_ocr_source("复用旧文本", old_text or "", old_text)
+                return (old_text or "").strip(), colors
+            await self._log_manual_ocr_source("框内检测", text, old_text)
+            return text, colors
 
         color_source = merge_textlines[0]
-        return (
-            self._join_manual_ocr_texts(
-                [getattr(line, "text", "") for line in merge_textlines]
-            ),
-            (
-                getattr(color_source, "fg_colors", (0, 0, 0)),
-                getattr(color_source, "bg_colors", (255, 255, 255)),
-            ),
+        text = self._join_manual_ocr_texts(
+            [getattr(line, "text", "") for line in merge_textlines]
         )
+        colors = (
+            getattr(color_source, "fg_colors", (0, 0, 0)),
+            getattr(color_source, "bg_colors", (255, 255, 255)),
+        )
+        if self._manual_ocr_is_low_quality(text, old_text):
+            await self._log_manual_ocr_source("复用旧文本", old_text or "", old_text)
+            return (old_text or "").strip(), colors
+        await self._log_manual_ocr_source("单框兜底" if single_box_used else "框内检测", text, old_text)
+        return text, colors
 
     async def _translate_manual_texts(self, texts: list[str]) -> list[str]:
         if not texts:
@@ -1246,12 +1376,14 @@ class CoreEngine:
             translated_slots: list[int] = []
             for slot in reocr_slots:
                 region = all_regions[slot]
+                old_text = getattr(region, "text", "")
                 text, colors = await self._ocr_user_bbox(
                     core,
                     translator,
                     config,
                     payload["img_rgb"],
                     getattr(region, "ocr_bbox", _region_bbox(region)),
+                    old_text,
                 )
                 if not text:
                     region.text = ""

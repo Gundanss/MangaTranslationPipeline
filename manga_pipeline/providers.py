@@ -94,11 +94,31 @@ def _tagged_prompt(texts: list[str]) -> str:
 
 
 _MODEL_TAG_PATTERN = re.compile(r"(?:<\|\d+\|>|</\|\d+\|>|<\|/\d+\|>)")
+_NOISY_TAG_PATTERN = re.compile(
+    r"</?\s*(?:原文|当前译文|待润色译文|润色译文|译文|翻译|translation|"
+    r"source|target|td|text|original|translated)\b[^>]*>",
+    flags=re.IGNORECASE,
+)
+_PREFERRED_TRANSLATION_LABEL_PATTERN = re.compile(
+    r"(?:^|\n)\s*<?\s*(?:当前译文|待润色译文|润色译文|译文|翻译|translation|target|td)"
+    r"\s*>?\s*[:：>]?\s*",
+    flags=re.IGNORECASE,
+)
+_SOURCE_LABEL_PATTERN = re.compile(
+    r"(?:^|\n)\s*<?\s*(?:原文|source|original|text)\s*>?\s*[:：>]?\s*",
+    flags=re.IGNORECASE,
+)
 
 
 def sanitize_translation_text(text: str) -> str:
     cleaned = text.strip()
     cleaned = re.sub(r"^```(?:\w+)?\s*|\s*```$", "", cleaned, flags=re.DOTALL)
+    cleaned = _NOISY_TAG_PATTERN.sub("\n", cleaned)
+    preferred_labels = list(_PREFERRED_TRANSLATION_LABEL_PATTERN.finditer(cleaned))
+    if preferred_labels:
+        cleaned = cleaned[preferred_labels[-1].end() :]
+    cleaned = _SOURCE_LABEL_PATTERN.sub("\n", cleaned)
+    cleaned = _PREFERRED_TRANSLATION_LABEL_PATTERN.sub("\n", cleaned)
     cleaned = _MODEL_TAG_PATTERN.sub("", cleaned)
     cleaned = re.sub(
         r"^(?:译文|翻译|translation)\s*[:：]\s*",
@@ -106,6 +126,7 @@ def sanitize_translation_text(text: str) -> str:
         cleaned,
         flags=re.IGNORECASE,
     )
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
     return cleaned.strip()
 
 
@@ -160,12 +181,14 @@ class OllamaProvider(TranslatorProvider):
         self, source_texts: list[str], translations: list[str], target: str
     ) -> list[str]:
         inputs = [
-            f"原文：{source}\n当前译文：{translation}"
+            f"源文本={json.dumps(source, ensure_ascii=False)}\n待润色译文={json.dumps(translation, ensure_ascii=False)}"
             for source, translation in zip(source_texts, translations)
         ]
         system = (
             f"你是漫画译文校对。将每条当前译文润色为自然简洁的{TARGET_NAMES[target]}，"
-            "不改变含义，不添加解释，保留每个 <|n|> 编号，只输出编号译文。"
+            "不改变含义，不添加解释，不复述源文本。"
+            "保留每个 <|n|> 编号，只输出编号和润色后的纯译文。"
+            "禁止输出“原文”“当前译文”“待润色译文”“译文”等字段名，禁止输出 XML/HTML 标签。"
         )
         try:
             return await self._translate_with_format_fallback(

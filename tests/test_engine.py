@@ -604,7 +604,7 @@ def test_reprocess_manual_box_detects_and_merges_inner_textlines(
             return None
 
         async def _run_detection(self, config, ctx):
-            assert ctx.img_rgb.shape == (8, 8, 3)
+            assert ctx.img_rgb.shape == (12, 12, 3)
             return (
                 [
                     FakeQuadrilateral(
@@ -714,6 +714,310 @@ def test_reprocess_manual_box_detects_and_merges_inner_textlines(
     assert regions[0]["text"] == "右左"
     assert regions[0]["translation"] == "合并译文"
     assert np.array_equal(np.array(Image.open(output_path)), clean + 9)
+
+
+def test_reprocess_manual_box_keeps_old_text_when_new_ocr_is_poor(
+    tmp_path, monkeypatch
+):
+    clean = np.zeros((12, 12, 3), dtype=np.uint8)
+    input_path = tmp_path / "input.png"
+    output_path = tmp_path / "output.png"
+    context_path = tmp_path / "context.pkl"
+    regions_path = tmp_path / "regions.json"
+    Image.fromarray(clean).save(input_path)
+
+    with context_path.open("wb") as file:
+        pickle.dump(
+            {
+                "config": SimpleNamespace(),
+                "text_regions": [],
+                "img_rgb": clean.copy(),
+                "img_inpainted": clean.copy(),
+                "img_alpha": None,
+            },
+            file,
+        )
+
+    class FakeQuadrilateral:
+        def __init__(self, pts, text, prob, *colors):
+            self.pts = np.array(pts)
+            self.text = text
+            self.prob = prob
+            self._fg = np.array(colors[:3] or (20, 20, 20))
+            self._bg = np.array(colors[3:6] or (240, 240, 240))
+
+        @property
+        def fg_colors(self):
+            return self._fg
+
+        @property
+        def bg_colors(self):
+            return self._bg
+
+    class FakeTextBlock(FakeRegion):
+        def __init__(
+            self,
+            lines,
+            texts=None,
+            font_size=12,
+            translation="",
+            fg_color=(0, 0, 0),
+            bg_color=(255, 255, 255),
+            **_kwargs,
+        ):
+            super().__init__(translation)
+            self.lines = np.array(lines)
+            self.text = (texts or [""])[0]
+            self.font_size = font_size
+            self._fg = np.array(fg_color)
+            self._bg = np.array(bg_color)
+
+    class FakeTranslator:
+        def add_progress_hook(self, _hook):
+            return None
+
+        async def _run_detection(self, config, ctx):
+            return [], None, None
+
+        async def _run_ocr(self, config, ctx):
+            ctx.textlines[0].text = "あ"
+            return ctx.textlines
+
+        async def _run_mask_refinement(self, config, ctx):
+            return np.zeros((12, 12), dtype=np.uint8)
+
+        async def _run_inpainting(self, config, ctx):
+            return clean.copy()
+
+        async def _run_text_rendering(self, config, ctx):
+            assert ctx.text_regions[0].text == "ちゃんと勉強しなさい"
+            assert ctx.text_regions[0].translation == "保留旧译文"
+            return clean + 10
+
+    monkeypatch.setattr(engine, "_mps_available", lambda: False)
+    monkeypatch.setattr(
+        engine,
+        "_load_text_render",
+        lambda: SimpleNamespace(
+            calc_horizontal=lambda font_size, text, width, height, lang, hyphenate: (
+                [text],
+                [min(width, font_size)],
+            ),
+            calc_vertical=lambda font_size, text, height: ([text], [min(height, font_size)]),
+        ),
+    )
+    monkeypatch.setattr(
+        engine.CoreEngine,
+        "_build",
+        lambda self, use_gpu: (
+            {
+                "Quadrilateral": FakeQuadrilateral,
+                "TextBlock": FakeTextBlock,
+                "dump_image": lambda base_image, rendered, alpha: Image.fromarray(
+                    rendered
+                ),
+            },
+            FakeTranslator(),
+        ),
+    )
+    monkeypatch.setattr(
+        engine.CoreEngine,
+        "_config",
+        lambda self, core, use_gpu: SimpleNamespace(),
+    )
+    monkeypatch.setattr(engine, "_save_rerender_payload", lambda *_args: None)
+
+    runner = engine.CoreEngine(
+        DummyProvider({"ちゃんと勉強しなさい": "保留旧译文"}),
+        "ja",
+        "zh-CN",
+        None,
+        "auto",
+        "auto",
+        None,
+        lambda *_args, **_kwargs: asyncio.sleep(0),
+        lambda *_args, **_kwargs: asyncio.sleep(0),
+    )
+
+    regions = asyncio.run(
+        runner.reprocess_regions(
+            input_path,
+            output_path,
+            context_path,
+            regions_path,
+            [
+                {
+                    "index": 0,
+                    "bbox": [2, 2, 10, 10],
+                    "ocr_bbox": [2, 2, 10, 10],
+                    "render_bbox": [2, 2, 10, 10],
+                    "enabled": True,
+                    "text": "ちゃんと勉強しなさい",
+                    "translation": "旧译文",
+                    "font_size": 24,
+                    "direction": "auto",
+                    "alignment": "left",
+                    "foreground": "#000000",
+                    "outline": "#FFFFFF",
+                }
+            ],
+            [0],
+        )
+    )
+
+    assert regions[0]["text"] == "ちゃんと勉強しなさい"
+    assert regions[0]["translation"] == "保留旧译文"
+    assert np.array_equal(np.array(Image.open(output_path)), clean + 10)
+
+
+def test_reprocess_multiple_manual_boxes_fallback_uses_each_old_text(
+    tmp_path, monkeypatch
+):
+    clean = np.zeros((16, 16, 3), dtype=np.uint8)
+    input_path = tmp_path / "input.png"
+    output_path = tmp_path / "output.png"
+    context_path = tmp_path / "context.pkl"
+    regions_path = tmp_path / "regions.json"
+    Image.fromarray(clean).save(input_path)
+
+    first = FakeRegion("旧译文一")
+    first.text = "ちゃんと勉強しなさい"
+    first.ocr_bbox = [0, 0, 8, 8]
+    first.render_bbox = [0, 0, 8, 8]
+    first.enabled = True
+    second = FakeRegion("旧译文二")
+    second.text = "実はママの体しか見てないんだよね"
+    second.ocr_bbox = [8, 0, 16, 8]
+    second.render_bbox = [8, 0, 16, 8]
+    second.enabled = True
+
+    with context_path.open("wb") as file:
+        pickle.dump(
+            {
+                "config": SimpleNamespace(),
+                "text_regions": [first, second],
+                "img_rgb": clean.copy(),
+                "img_inpainted": clean.copy(),
+                "img_alpha": None,
+                "clean_image_trusted": True,
+            },
+            file,
+        )
+
+    class FakeTranslator:
+        def add_progress_hook(self, _hook):
+            return None
+
+        async def _run_mask_refinement(self, config, ctx):
+            return np.zeros((16, 16), dtype=np.uint8)
+
+        async def _run_inpainting(self, config, ctx):
+            return clean.copy()
+
+        async def _run_text_rendering(self, config, ctx):
+            assert [region.text for region in ctx.text_regions] == [
+                "ちゃんと勉強しなさい",
+                "実はママの体しか見てないんだよね",
+            ]
+            return clean + 11
+
+    async def fake_ocr_user_bbox(
+        self, core, translator, config, image, bbox, old_text=None
+    ):
+        return (old_text or "").strip(), None
+
+    monkeypatch.setattr(engine, "_mps_available", lambda: False)
+    monkeypatch.setattr(
+        engine,
+        "_load_text_render",
+        lambda: SimpleNamespace(
+            calc_horizontal=lambda font_size, text, width, height, lang, hyphenate: (
+                [text],
+                [min(width, font_size)],
+            ),
+            calc_vertical=lambda font_size, text, height: ([text], [min(height, font_size)]),
+        ),
+    )
+    monkeypatch.setattr(
+        engine.CoreEngine,
+        "_build",
+        lambda self, use_gpu: (
+            {
+                "dump_image": lambda base_image, rendered, alpha: Image.fromarray(
+                    rendered
+                ),
+            },
+            FakeTranslator(),
+        ),
+    )
+    monkeypatch.setattr(
+        engine.CoreEngine,
+        "_config",
+        lambda self, core, use_gpu: SimpleNamespace(),
+    )
+    monkeypatch.setattr(engine.CoreEngine, "_ocr_user_bbox", fake_ocr_user_bbox)
+
+    runner = engine.CoreEngine(
+        DummyProvider(
+            {
+                "ちゃんと勉強しなさい": "保留旧译文一",
+                "実はママの体しか見てないんだよね": "保留旧译文二",
+            }
+        ),
+        "ja",
+        "zh-CN",
+        None,
+        "auto",
+        "auto",
+        None,
+        lambda *_args, **_kwargs: asyncio.sleep(0),
+        lambda *_args, **_kwargs: asyncio.sleep(0),
+    )
+
+    updates = serialize_regions([first, second])
+    regions = asyncio.run(
+        runner.reprocess_regions(
+            input_path,
+            output_path,
+            context_path,
+            regions_path,
+            updates,
+            [0, 1],
+        )
+    )
+
+    assert [region["text"] for region in regions] == [
+        "ちゃんと勉強しなさい",
+        "実はママの体しか見てないんだよね",
+    ]
+    assert [region["translation"] for region in regions] == [
+        "保留旧译文一",
+        "保留旧译文二",
+    ]
+    assert np.array_equal(np.array(Image.open(output_path)), clean + 11)
+
+
+def test_manual_ocr_quality_rejects_japanese_text_with_many_missing_chars():
+    runner = engine.CoreEngine(
+        DummyProvider({}),
+        "ja",
+        "zh-CN",
+        None,
+        "auto",
+        "auto",
+        None,
+        lambda *_args, **_kwargs: asyncio.sleep(0),
+        lambda *_args, **_kwargs: asyncio.sleep(0),
+    )
+
+    assert runner._manual_ocr_is_low_quality(
+        "夫は…ママのだよ見て",
+        "実は…ママの体しか見てないんだよね",
+    )
+    assert not runner._manual_ocr_is_low_quality(
+        "実は…ママの体しか見てないんだよね",
+        "実は…ママの体しか見てないんだよね",
+    )
 
 
 def test_rerender_preserves_multiline_translation_and_auto_font_size(

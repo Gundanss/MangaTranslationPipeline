@@ -42,6 +42,21 @@ def test_sanitize_translation_text_strips_model_tags():
     )
 
 
+def test_sanitize_translation_text_prefers_current_translation_label():
+    assert (
+        sanitize_translation_text(
+            "原文>你作弊了吧？明明说了要好好学习的啊\n"
+            "当前译文>你作弊了吧？明明说过要认真学习啊<td>"
+        )
+        == "你作弊了吧？明明说过要认真学习啊"
+    )
+
+
+def test_parse_tagged_response_cleans_polish_markup():
+    response = "<|1|><原文>勉強しなさい</原文><td>译文：好好学习</td>"
+    assert _parse_tagged_response(response, 1) == ["好好学习"]
+
+
 def test_parse_tagged_response_strips_malformed_closing_tags():
     response = "<|1|>第一句</|1|>\n<|2|>第二句</|2|>"
     assert _parse_tagged_response(response, 2) == ["第一句", "第二句"]
@@ -288,6 +303,27 @@ def test_ollama_falls_back_to_single_regions_when_batch_format_is_invalid():
 
     assert result == ["翻译：第一句", "翻译：第二句"]
     assert events[0][1] == "translation-fallback"
+
+
+def test_ollama_polish_prompt_uses_structured_inputs():
+    captured = {}
+    provider = OllamaProvider("http://localhost:11434", "test-model")
+
+    async def request_tagged(system, texts, label, temperature):
+        captured["system"] = system
+        captured["texts"] = texts
+        return ["自然译文"]
+
+    provider._request_tagged = request_tagged
+
+    result = asyncio.run(
+        provider.polish(["勉強しなさい"], ["你要学习"], "zh-CN")
+    )
+
+    assert result == ["自然译文"]
+    assert "禁止输出" in captured["system"]
+    assert "源文本=" in captured["texts"][0]
+    assert "待润色译文=" in captured["texts"][0]
 
 
 def test_provider_retry_is_reported():
