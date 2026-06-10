@@ -919,6 +919,43 @@ class CoreEngine:
                 return True
         return False
 
+    def _manual_ocr_junk_score(self, text: str) -> int:
+        if not text:
+            return 0
+        score = 0
+        score += len(re.findall(r"[A-Za-z]", text)) * 2
+        score += sum(text.count(marker) * 8 for marker in ("<", ">", "�"))
+        return score
+
+    def _manual_ocr_should_replace_candidate(
+        self, new_text: str, current_text: str, old_text: str | None = None
+    ) -> bool:
+        new_clean = (new_text or "").strip()
+        if not new_clean:
+            return False
+        current_clean = (current_text or "").strip()
+        if not current_clean:
+            return True
+
+        new_score = self._manual_ocr_text_value(new_clean)
+        current_score = self._manual_ocr_text_value(current_clean)
+        old_clean = (old_text or "").strip()
+        if old_clean and self._manual_ocr_text_value(old_clean) >= 4:
+            new_recall = self._manual_ocr_char_recall(new_clean, old_clean)
+            current_recall = self._manual_ocr_char_recall(current_clean, old_clean)
+            if new_recall >= current_recall + 0.05 and new_score >= current_score - 2:
+                return True
+            if current_recall >= new_recall + 0.05 and current_score >= new_score - 2:
+                return False
+
+        new_junk = self._manual_ocr_junk_score(new_clean)
+        current_junk = self._manual_ocr_junk_score(current_clean)
+        if new_score > current_score and new_junk <= current_junk + 1:
+            return True
+        if current_junk > new_junk and new_score >= current_score - 1:
+            return True
+        return False
+
     def _textline_center(self, textline: Any) -> tuple[float, float]:
         if hasattr(textline, "pts"):
             points = np.asarray(textline.pts, dtype=np.float32).reshape(-1, 2)
@@ -1033,17 +1070,25 @@ class CoreEngine:
         )
 
     def _manual_ocr_vertical_column_bboxes(
-        self, image: np.ndarray, bbox: list[int]
+        self, image: np.ndarray, bbox: list[int], expand_ratio: float = 0.0
     ) -> list[list[int]]:
         if self.source_language != "ja":
             return []
         height, width = image.shape[:2]
-        x1, y1, x2, y2 = _clip_bbox(bbox, width, height)
-        box_width = x2 - x1
-        box_height = y2 - y1
+        bx1, by1, bx2, by2 = _clip_bbox(bbox, width, height)
+        box_width = bx2 - bx1
+        box_height = by2 - by1
         if box_height < 48 or box_height / max(1, box_width) < 1.6:
             return []
 
+        expand = max(0, int(round(max(box_width, box_height) * expand_ratio)))
+        x1, y1, x2, y2 = _clip_bbox(
+            [bx1 - expand, by1 - expand, bx2 + expand, by2 + expand],
+            width,
+            height,
+        )
+        analysis_width = x2 - x1
+        analysis_height = y2 - y1
         crop = image[y1:y2, x1:x2]
         if crop.size == 0:
             return []
@@ -1069,14 +1114,12 @@ class CoreEngine:
             cx, cy, cw, ch, area = [int(value) for value in stats[label]]
             if area < min_area:
                 continue
-            if cw > box_width * 0.55 or ch > box_height * 0.3:
+            if cw > analysis_width * 0.55 or ch > analysis_height * 0.3:
                 continue
-            if (
-                cx <= 1
-                or cy <= 1
-                or cx + cw >= box_width - 1
-                or cy + ch >= box_height - 1
-            ):
+            gx1, gy1, gx2, gy2 = x1 + cx, y1 + cy, x1 + cx + cw, y1 + cy + ch
+            overlap_width = max(0, min(gx2, bx2) - max(gx1, bx1))
+            overlap_height = max(0, min(gy2, by2) - max(gy1, by1))
+            if overlap_width * overlap_height < max(1, cw * ch) * 0.08:
                 continue
             center_x, center_y = [float(value) for value in centroids[label]]
             components.append((cx, cy, cx + cw, cy + ch, center_x, center_y, area))
@@ -1134,7 +1177,10 @@ class CoreEngine:
         )
 
     def _manual_ocr_should_prefer_columns(
-        self, column_items: list[Any], current_items: list[Any]
+        self,
+        column_items: list[Any],
+        current_items: list[Any],
+        old_text: str | None = None,
     ) -> bool:
         if not column_items:
             return False
@@ -1142,6 +1188,10 @@ class CoreEngine:
             return True
         column_text = self._manual_ocr_text_from_items(column_items)
         current_text = self._manual_ocr_text_from_items(current_items)
+        if self._manual_ocr_should_replace_candidate(
+            column_text, current_text, old_text
+        ):
+            return True
         column_score = self._manual_ocr_text_value(column_text)
         current_score = self._manual_ocr_text_value(current_text)
         if column_score >= current_score + max(2, int(current_score * 0.25)):
@@ -1235,8 +1285,19 @@ class CoreEngine:
         ocr_textlines = await translator._run_ocr(config, crop_ctx) if detected_textlines else []
         ocr_textlines = [line for line in ocr_textlines if getattr(line, "text", "").strip()]
         ocr_source = "框内检测"
-        column_bboxes = self._manual_ocr_vertical_column_bboxes(image, [x1, y1, x2, y2])
-        if column_bboxes:
+        best_column_text = ""
+        best_column_textlines: list[Any] = []
+        seen_column_bboxes: set[tuple[tuple[int, int, int, int], ...]] = set()
+        for expand_ratio in (0.0, 0.02):
+            column_bboxes = self._manual_ocr_vertical_column_bboxes(
+                image, [x1, y1, x2, y2], expand_ratio
+            )
+            if not column_bboxes:
+                continue
+            column_key = tuple(tuple(bbox) for bbox in column_bboxes)
+            if column_key in seen_column_bboxes:
+                continue
+            seen_column_bboxes.add(column_key)
             crop_ctx.textlines = [
                 core["Quadrilateral"](
                     _bbox_to_polygon(
@@ -1258,9 +1319,17 @@ class CoreEngine:
                 for line in column_textlines
                 if getattr(line, "text", "").strip()
             ]
-            if self._manual_ocr_should_prefer_columns(column_textlines, ocr_textlines):
-                ocr_textlines = column_textlines
-                ocr_source = "竖排列切分"
+            column_text = self._manual_ocr_text_from_items(column_textlines)
+            if self._manual_ocr_should_replace_candidate(
+                column_text, best_column_text, old_text
+            ):
+                best_column_text = column_text
+                best_column_textlines = column_textlines
+        if self._manual_ocr_should_prefer_columns(
+            best_column_textlines, ocr_textlines, old_text
+        ):
+            ocr_textlines = best_column_textlines
+            ocr_source = "竖排列切分"
         if not ocr_textlines:
             tight_bbox = self._manual_ocr_tight_text_bbox(image, [x1, y1, x2, y2])
             if tight_bbox is not None:
