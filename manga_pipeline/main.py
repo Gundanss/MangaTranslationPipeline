@@ -125,9 +125,6 @@ def _normalize_region_json(regions: list[dict]) -> tuple[list[dict], bool]:
         if "mask_dilation_offset" not in item:
             item["mask_dilation_offset"] = 20
             changed = True
-        if "angle" not in item:
-            item["angle"] = 0
-            changed = True
         cleaned = sanitize_translation_text(item.get("translation", ""))
         if cleaned != item.get("translation", ""):
             item["translation"] = cleaned

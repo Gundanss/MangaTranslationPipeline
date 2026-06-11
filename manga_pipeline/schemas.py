@@ -51,7 +51,6 @@ class RegionUpdate(BaseModel):
     enabled: bool = True
     text: str
     translation: str
-    angle: float = Field(default=0, ge=-180, le=180)
     font_size: int | None = Field(default=None, ge=6, le=300)
     direction: TextDirection = "auto"
     alignment: TextAlignment = "left"

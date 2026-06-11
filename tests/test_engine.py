@@ -25,7 +25,6 @@ class FakeRegion:
         self.font_size = 12
         self._direction = "auto"
         self._alignment = "auto"
-        self.angle = 0
         self.adjust_bg_color = True
         self._fg = np.array([0, 0, 0])
         self._bg = np.array([255, 255, 255])
@@ -122,7 +121,6 @@ def test_serialize_regions_includes_ocr_and_render_boxes():
     region.render_bbox = [5, 6, 7, 8]
     region.enabled = False
     region.mask_dilation_offset = 13
-    region.angle = 17.5
 
     data = serialize_regions([region])
 
@@ -131,7 +129,6 @@ def test_serialize_regions_includes_ocr_and_render_boxes():
     assert data[0]["render_bbox"] == [5, 6, 7, 8]
     assert data[0]["enabled"] is False
     assert data[0]["mask_dilation_offset"] == 13
-    assert data[0]["angle"] == 17.5
 
 
 def test_mask_refinement_groups_regions_by_dilation_offset():
@@ -361,7 +358,6 @@ def test_rerender_uses_clean_background_and_latest_translation(tmp_path, monkeyp
             assert ctx.text_regions[0].translation == "new text"
             assert ctx.text_regions[0].xyxy.tolist() == [1, 0, 3, 4]
             assert ctx.text_regions[0].target_lang == "CHS"
-            assert ctx.text_regions[0].angle == 14
             return ctx.img_inpainted + 5
 
     monkeypatch.setattr(
@@ -398,7 +394,6 @@ def test_rerender_uses_clean_background_and_latest_translation(tmp_path, monkeyp
                     "render_bbox": [1, 0, 3, 4],
                     "text": "edited source",
                     "translation": "new text",
-                    "angle": 14,
                     "font_size": 18,
                     "direction": "auto",
                     "alignment": "center",

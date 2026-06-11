@@ -128,7 +128,6 @@ def test_normalize_region_json_adds_default_mask_dilation():
 
     assert changed is True
     assert regions[0]["mask_dilation_offset"] == 20
-    assert regions[0]["angle"] == 0
 
 
 class FakeDatabase:

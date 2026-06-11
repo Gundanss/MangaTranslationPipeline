@@ -289,7 +289,6 @@ small, .muted { color: var(--muted); font-size: 11px; }
   font-weight: 800;
   text-shadow: 0 1px 2px #000;
   cursor: move;
-  transform-origin: center center;
 }
 .region-box.render {
   border-color: rgba(55,213,255,.95);
@@ -314,30 +313,6 @@ small, .muted { color: var(--muted); font-size: 11px; }
 .resize-handle.s { left: 50%; bottom: -6px; transform: translateX(-50%); cursor: ns-resize; }
 .resize-handle.sw { left: -6px; bottom: -6px; cursor: nesw-resize; }
 .resize-handle.w { left: -6px; top: 50%; transform: translateY(-50%); cursor: ew-resize; }
-.rotate-handle {
-  position: absolute;
-  left: 50%;
-  top: -34px;
-  width: 14px;
-  height: 14px;
-  border: 2px solid #1d1d1b;
-  border-radius: 50%;
-  background: #ffcc4d;
-  transform: translateX(-50%);
-  pointer-events: auto;
-  cursor: grab;
-}
-.rotate-handle::after {
-  content: "";
-  position: absolute;
-  left: 50%;
-  top: 12px;
-  width: 2px;
-  height: 18px;
-  background: #ffcc4d;
-  transform: translateX(-50%);
-}
-.rotate-handle:active { cursor: grabbing; }
 .region-editor { padding: 16px; border-left: 1px solid var(--line); background: var(--surface); }
 .editor-placeholder { color: var(--muted); font-size: 12px; padding: 30px 8px; text-align: center; }
 .region-title { margin-bottom: 12px; }

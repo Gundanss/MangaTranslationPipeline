@@ -355,14 +355,6 @@ function normalizeRegionAlignment(value) {
   return ["left", "center", "right"].includes(value) ? value : "left";
 }
 
-function normalizeRegionAngle(value) {
-  let angle = Number(value);
-  if (!Number.isFinite(angle)) angle = 0;
-  while (angle > 180) angle -= 360;
-  while (angle < -180) angle += 360;
-  return Math.round(angle * 10) / 10;
-}
-
 function ensureRegionShape(region, index) {
   const fallback = region.render_bbox || region.ocr_bbox || region.bbox || [0, 0, 80, 80];
   region.index = index;
@@ -377,7 +369,6 @@ function ensureRegionShape(region, index) {
   region.outline = region.outline || "#FFFFFF";
   region.text = region.text || "";
   region.translation = region.translation || "";
-  region.angle = normalizeRegionAngle(region.angle);
   region.mask_dilation_offset = normalizeMaskDilationOffset(region.mask_dilation_offset);
   return region;
 }
@@ -429,11 +420,6 @@ function setRegionBBox(region, bbox) {
     region.bbox = next;
   }
   updateBBoxInputs(region);
-}
-
-function setRegionAngle(region, angle) {
-  region.angle = normalizeRegionAngle(angle);
-  updateAngleInput(region);
 }
 
 function editorImageUrl() {
@@ -533,7 +519,6 @@ function renderOverlays() {
     box.style.top = `${y1 * scaleY}px`;
     box.style.width = `${Math.max(12, (x2 - x1) * scaleX)}px`;
     box.style.height = `${Math.max(12, (y2 - y1) * scaleY)}px`;
-    box.style.transform = state.editorMode === "render" ? `rotate(${region.angle}deg)` : "";
     box.textContent = region.index + 1;
     box.onpointerdown = (event) => startBoxDrag(event, region.index, null);
     if (state.activeRegion === region.index) {
@@ -543,13 +528,6 @@ function renderOverlays() {
         grip.onpointerdown = (event) => startBoxDrag(event, region.index, handle);
         box.append(grip);
       });
-      if (state.editorMode === "render") {
-        const rotate = document.createElement("span");
-        rotate.className = "rotate-handle";
-        rotate.title = "拖拽调整译文角度";
-        rotate.onpointerdown = (event) => startBoxDrag(event, region.index, "rotate");
-        box.append(rotate);
-      }
     }
     overlay.append(box);
   });
@@ -575,7 +553,6 @@ function startBoxDrag(event, index, handle) {
     handle,
     startPoint: pointerToPixel(event),
     startBBox: getRegionBBox(state.regions[index]),
-    startAngle: state.regions[index].angle,
   };
   window.addEventListener("pointermove", moveBoxDrag);
   window.addEventListener("pointerup", endBoxDrag, { once: true });
@@ -589,11 +566,7 @@ function moveBoxDrag(event) {
   const dy = point.y - state.dragState.startPoint.y;
   let [x1, y1, x2, y2] = state.dragState.startBBox;
   const handle = state.dragState.handle;
-  if (handle === "rotate") {
-    const centerX = (x1 + x2) / 2;
-    const centerY = (y1 + y2) / 2;
-    setRegionAngle(region, Math.atan2(point.y - centerY, point.x - centerX) * 180 / Math.PI + 90);
-  } else if (!handle) {
+  if (!handle) {
     x1 += dx; x2 += dx; y1 += dy; y2 += dy;
   } else {
     if (handle.includes("w")) x1 += dx;
@@ -619,11 +592,6 @@ function updateBBoxInputs(region) {
   $("regionBox").textContent = `${x1}, ${y1}, ${x2}, ${y2}`;
 }
 
-function updateAngleInput(region) {
-  $("regionAngle").value = normalizeRegionAngle(region.angle);
-  $("regionAngle").disabled = state.editorMode !== "render";
-}
-
 function syncBoxInputs() {
   if (state.activeRegion === null) return;
   const region = state.regions[state.activeRegion];
@@ -644,7 +612,6 @@ function populateRegionForm(index) {
   $("regionText").value = region.text;
   $("regionTranslation").value = region.translation;
   $("regionFontSize").value = region.font_size ?? "";
-  updateAngleInput(region);
   $("regionDirection").value = ["auto", "horizontal", "vertical"].includes(region.direction) ? region.direction : "auto";
   $("regionAlignment").value = normalizeRegionAlignment(region.alignment);
   $("regionForeground").value = region.foreground;
@@ -667,7 +634,6 @@ function syncActiveRegion() {
   if (!region) return;
   region.text = $("regionText").value;
   region.translation = $("regionTranslation").value;
-  region.angle = normalizeRegionAngle($("regionAngle").value);
   region.font_size = normalizeOptionalFontSize($("regionFontSize").value);
   region.direction = $("regionDirection").value;
   region.alignment = $("regionAlignment").value;
@@ -704,7 +670,6 @@ function addRegion() {
     enabled: true,
     text: "",
     translation: "",
-    angle: 0,
     font_size: null,
     direction: "auto",
     alignment: "left",
@@ -1036,12 +1001,6 @@ function bindEvents() {
       renderOverlays();
     };
   });
-  $("regionAngle").onchange = () => {
-    if (state.activeRegion === null) return;
-    const region = state.regions[state.activeRegion];
-    setRegionAngle(region, $("regionAngle").value);
-    renderOverlays();
-  };
   window.addEventListener("resize", renderOverlays);
   $("canvasWrap").addEventListener("scroll", renderOverlays);
   $("logWindow").addEventListener("scroll", (event) => {

@@ -141,18 +141,6 @@ def _normalize_mask_dilation_offset(value: Any) -> int:
     return max(MIN_MASK_DILATION_OFFSET, min(MAX_MASK_DILATION_OFFSET, normalized))
 
 
-def _normalize_region_angle(value: Any) -> float:
-    try:
-        angle = float(value)
-    except (TypeError, ValueError):
-        angle = 0.0
-    while angle > 180:
-        angle -= 360
-    while angle < -180:
-        angle += 360
-    return angle
-
-
 def _region_mask_dilation_offset(region: Any) -> int:
     return _normalize_mask_dilation_offset(
         getattr(region, "mask_dilation_offset", DEFAULT_MASK_DILATION_OFFSET)
@@ -338,7 +326,6 @@ def _normalize_region_updates(
                 "enabled": bool(update.get("enabled", True)),
                 "translation": sanitize_translation_text(update.get("translation", "")),
                 "font_size": _normalize_optional_font_size(update.get("font_size")),
-                "angle": _normalize_region_angle(update.get("angle")),
                 "mask_dilation_offset": _normalize_mask_dilation_offset(
                     update.get("mask_dilation_offset")
                 ),
@@ -364,8 +351,6 @@ def _fill_update_bbox_defaults(
                 item["bbox"] = item["render_bbox"]
             if "mask_dilation_offset" not in item:
                 item["mask_dilation_offset"] = _region_mask_dilation_offset(region)
-            if "angle" not in item:
-                item["angle"] = getattr(region, "angle", 0)
         result.append(item)
     return result
 
@@ -512,7 +497,6 @@ def _make_text_region(
     outline: tuple[int, int, int] = (255, 255, 255),
     font_size: int | None = None,
     mask_dilation_offset: int = DEFAULT_MASK_DILATION_OFFSET,
-    angle: float = 0,
 ) -> Any:
     block = core["TextBlock"](
         [_bbox_to_polygon(bbox)],
@@ -524,7 +508,6 @@ def _make_text_region(
     )
     block.text_raw = block.text
     block.adjust_bg_color = False
-    block.angle = _normalize_region_angle(angle)
     _update_bbox_fields(block, bbox, bbox)
     _set_region_font_preference(block, font_size)
     _set_region_mask_dilation_offset(block, mask_dilation_offset)
@@ -800,7 +783,6 @@ def serialize_regions(regions: list[Any]) -> list[dict[str, Any]]:
                     getattr(region, "translation", "")
                 ),
                 "font_size": font_size,
-                "angle": _normalize_region_angle(getattr(region, "angle", 0)),
                 "direction": _public_direction(
                     getattr(region, "_direction", "auto")
                 ),
@@ -1740,7 +1722,6 @@ class CoreEngine:
                     _hex_rgb(update["outline"]),
                     update.get("font_size"),
                     update["mask_dilation_offset"],
-                    update["angle"],
                 )
                 changed.add(update["index"])
             else:
@@ -1764,7 +1745,6 @@ class CoreEngine:
             )
             region.enabled = update["enabled"]
             _set_region_mask_dilation_offset(region, update["mask_dilation_offset"])
-            region.angle = update["angle"]
             _update_bbox_fields(region, update["ocr_bbox"], update["render_bbox"])
             _set_region_geometry(region, update["ocr_bbox"])
             all_regions.append(region)
@@ -1900,7 +1880,6 @@ async def rerender(
         )
         region.enabled = update["enabled"]
         _set_region_mask_dilation_offset(region, update["mask_dilation_offset"])
-        region.angle = update["angle"]
         _update_bbox_fields(region, update["ocr_bbox"], update["render_bbox"])
         _set_region_geometry(region, update["render_bbox"])
         _prepare_region_for_render(
