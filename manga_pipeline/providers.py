@@ -12,6 +12,7 @@ from typing import Any
 
 import httpx
 
+# 语言标签会同时用于提示词和远程接口；不同服务的语言码差异统一收敛在这里。
 SOURCE_NAMES = {"ja": "日语", "en": "英语"}
 TARGET_NAMES = {
     "zh-CN": "简体中文",
@@ -41,16 +42,21 @@ _BING_TOKEN_PATTERN = re.compile(
 
 
 class TranslationError(RuntimeError):
+    """面向用户的翻译提供方异常，调用方可以直接透传提示文案。"""
+
     pass
 
 
 class TranslatorProvider(ABC):
+    """本地模型、官方 API 和免费网页翻译共用的接口。"""
+
     log_callback = None
 
     def set_log_callback(self, callback) -> None:
         self.log_callback = callback
 
     async def _run_with_retry(self, label: str, operation, attempts: int = 2):
+        """重试瞬时网络或服务异常，并记录每次重试。"""
         error: Exception | None = None
         for attempt in range(1, attempts + 1):
             try:
@@ -78,6 +84,8 @@ class TranslatorProvider(ABC):
 
 @dataclass
 class BingSession:
+    """从 Bing 翻译网页中抓取出的短时鉴权参数。"""
+
     ig: str
     iid: str
     key: str
@@ -90,6 +98,7 @@ class BingSession:
 
 
 def _tagged_prompt(texts: list[str]) -> str:
+    """给 OCR 区域编号，便于把模型返回结果准确对回原区域。"""
     return "\n".join(f"<|{index + 1}|>{text}" for index, text in enumerate(texts))
 
 
@@ -111,6 +120,7 @@ _SOURCE_LABEL_PATTERN = re.compile(
 
 
 def sanitize_translation_text(text: str) -> str:
+    """清理 LLM 常见的包裹标签和字段名，避免直接渲染进图片。"""
     cleaned = text.strip()
     cleaned = re.sub(r"^```(?:\w+)?\s*|\s*```$", "", cleaned, flags=re.DOTALL)
     cleaned = _NOISY_TAG_PATTERN.sub("\n", cleaned)
@@ -131,6 +141,7 @@ def sanitize_translation_text(text: str) -> str:
 
 
 def _parse_tagged_response(response: str, expected: int) -> list[str]:
+    """解析带编号的模型输出；缺号或空译文都直接判失败。"""
     matches = re.findall(
         r"<\|(\d+)\|>\s*(.*?)(?=<\|\d+\|>|$)", response, flags=re.DOTALL
     )
@@ -144,6 +155,7 @@ def _parse_tagged_response(response: str, expected: int) -> list[str]:
 
 
 def _parse_single_response(response: str) -> str:
+    """仅在编号解析不可用时，退回接受普通单条文本。"""
     try:
         return _parse_tagged_response(response, 1)[0]
     except TranslationError:
@@ -154,6 +166,8 @@ def _parse_single_response(response: str) -> str:
 
 
 class OllamaProvider(TranslatorProvider):
+    """本地 Ollama 翻译器，支持批量编号和单区域兜底。"""
+
     def __init__(self, base_url: str, model: str):
         self.base_url = base_url.rstrip("/")
         self.model = model
@@ -161,6 +175,7 @@ class OllamaProvider(TranslatorProvider):
     async def translate(
         self, texts: list[str], source: str, target: str
     ) -> list[str]:
+        """翻译 OCR 区域，同时要求模型保留 <|n|> 编号约定。"""
         if not texts:
             return []
         system = (
@@ -180,6 +195,7 @@ class OllamaProvider(TranslatorProvider):
     async def polish(
         self, source_texts: list[str], translations: list[str], target: str
     ) -> list[str]:
+        """润色已有机器译文，同时保持区域顺序完全不变。"""
         inputs = [
             f"源文本={json.dumps(source, ensure_ascii=False)}\n待润色译文={json.dumps(translation, ensure_ascii=False)}"
             for source, translation in zip(source_texts, translations)
@@ -242,6 +258,7 @@ class OllamaProvider(TranslatorProvider):
     async def _translate_with_format_fallback(
         self, system: str, texts: list[str], label: str, temperature: float
     ) -> list[str]:
+        """批量编号格式被模型破坏时，自动退回逐区域重试。"""
         try:
             return await self._request_tagged(system, texts, label, temperature)
         except TranslationError:
@@ -270,10 +287,13 @@ class OllamaProvider(TranslatorProvider):
 
 
 class GoogleProvider(TranslatorProvider):
+    """优先走 Google 官方 API；未配置时回退到公开网页接口。"""
+
     def __init__(self, api_key: str | None = None):
         self.api_key = (api_key or "").strip()
 
     def _parse_web_translation(self, payload: Any) -> str:
+        """拍平 Google 网页翻译的旧版返回结构。"""
         if not isinstance(payload, list) or not payload:
             raise TranslationError("Google 网页翻译返回格式异常")
         segments = payload[0]
@@ -291,6 +311,7 @@ class GoogleProvider(TranslatorProvider):
     async def _translate_official(
         self, texts: list[str], source: str, target: str
     ) -> list[str]:
+        """在已配置密钥时调用 Google Cloud Translation API。"""
         url = "https://translation.googleapis.com/language/translate/v2"
         payload = {"q": texts, "source": source, "target": target, "format": "text"}
 
@@ -311,6 +332,7 @@ class GoogleProvider(TranslatorProvider):
     async def _translate_web(
         self, texts: list[str], source: str, target: str
     ) -> list[str]:
+        """通过免费网页接口逐条翻译文本。"""
         async with httpx.AsyncClient(timeout=90) as client:
             results: list[str] = []
             for text in texts:
@@ -351,6 +373,8 @@ class GoogleProvider(TranslatorProvider):
 
 
 class BingWebProvider(TranslatorProvider):
+    """免费 Bing 网页翻译；本质上是模拟浏览器请求，天然更脆弱。"""
+
     def __init__(self, translator_url: str = BING_TRANSLATOR_URL):
         self.translator_url = translator_url.rstrip("/")
         self.translate_endpoint = f"{self.translator_url.rsplit('/', 1)[0]}/ttranslatev3"
@@ -367,6 +391,7 @@ class BingWebProvider(TranslatorProvider):
         translator_url: str = BING_TRANSLATOR_URL,
         origin: str = "https://cn.bing.com",
     ) -> BingSession:
+        """从翻译页 HTML 中提取请求所需的鉴权 token。"""
         ig_match = _BING_IG_PATTERN.search(content)
         iid_match = _BING_IID_PATTERN.search(content)
         token_match = _BING_TOKEN_PATTERN.search(content)
@@ -409,6 +434,7 @@ class BingWebProvider(TranslatorProvider):
     async def _ensure_session(
         self, client: httpx.AsyncClient, force_refresh: bool = False
     ) -> BingSession:
+        """在 token 快过期或鉴权失败后刷新 Bing 会话。"""
         if force_refresh or not self._is_session_valid(self._session):
             return await self._bootstrap(client)
         if self._session and self._session.cookie_header:
@@ -441,6 +467,7 @@ class BingWebProvider(TranslatorProvider):
         source: str,
         target: str,
     ) -> str:
+        """翻译单条文本；第一次遇到 400 往往意味着 token 已失效。"""
         for attempt in range(2):
             session = await self._ensure_session(client, force_refresh=attempt > 0)
             body = {
@@ -514,6 +541,8 @@ class BingWebProvider(TranslatorProvider):
 
 
 class MicrosoftProvider(TranslatorProvider):
+    """Microsoft Translator 官方 API 提供方。"""
+
     def __init__(self, api_key: str, region: str, endpoint: str):
         if not api_key or not region:
             raise TranslationError("尚未配置 Microsoft Translator API Key 与区域")
@@ -558,6 +587,7 @@ class MicrosoftProvider(TranslatorProvider):
 
 
 async def list_ollama_models(base_url: str) -> list[dict[str, Any]]:
+    """从 Ollama 读取本机已安装模型，不触发任何下载。"""
     try:
         async with httpx.AsyncClient(timeout=8) as client:
             response = await client.get(f"{base_url.rstrip('/')}/api/tags")
@@ -578,6 +608,7 @@ async def list_ollama_models(base_url: str) -> list[dict[str, Any]]:
 
 
 def create_provider(name: str, settings: dict[str, str], ollama_model: str | None):
+    """供批任务和单区域翻译接口共用的提供方工厂。"""
     if name == "ollama":
         return OllamaProvider(settings["ollama_base_url"], ollama_model or "")
     if name == "google":

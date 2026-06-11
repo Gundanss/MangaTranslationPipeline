@@ -15,6 +15,8 @@ from .secret_store import SecretStore
 
 
 class TaskManager:
+    """管理单后台 worker，并保护重模型操作不被并发踩踏。"""
+
     def __init__(self, database: Database, secrets: SecretStore):
         self.database = database
         self.secrets = secrets
@@ -29,6 +31,7 @@ class TaskManager:
         self.active_manual_edits = 0
 
     def start(self) -> None:
+        """为当前进程启动一个 worker；所有任务都串行经过它。"""
         if not self.worker_task or self.worker_task.done():
             self.worker_task = asyncio.create_task(self._worker())
 
@@ -38,6 +41,7 @@ class TaskManager:
         progress_callback,
         log_callback,
     ) -> CoreEngine:
+        """按任务配置和当前本地设置构造图像处理引擎。"""
         settings = self.secrets.get()
         provider = create_provider(config["provider"], settings, config.get("ollama_model"))
         polish_provider = None
@@ -67,6 +71,7 @@ class TaskManager:
         return self.shutdown_requested
 
     def _image_lock(self, image_id: str) -> asyncio.Lock:
+        """避免批处理和人工编辑同时操作同一张图片。"""
         lock = self.image_locks.get(image_id)
         if lock is None:
             lock = asyncio.Lock()
@@ -74,6 +79,7 @@ class TaskManager:
         return lock
 
     def _schedule_process_stop(self) -> None:
+        """给 HTTP 响应留一点刷新时间，再结束本地 uvicorn 进程。"""
         if self.stop_scheduled:
             return
         self.stop_scheduled = True
@@ -81,6 +87,7 @@ class TaskManager:
         loop.call_later(0.35, lambda: os.kill(os.getpid(), signal.SIGTERM))
 
     def _finalize_shutdown_if_idle(self) -> None:
+        """当没有排队任务、处理中图片和人工编辑时，真正结束进程。"""
         if (
             self.shutdown_requested
             and not self.stop_scheduled
@@ -102,6 +109,7 @@ class TaskManager:
         reason: str,
         log_message: str,
     ) -> int:
+        """只把仍在排队的图片标记为停止，保留已完成和历史失败页状态。"""
         stopped_count = 0
         for image in images[start_index:]:
             if image.get("status") != "queued":
@@ -125,6 +133,7 @@ class TaskManager:
         return stopped_count
 
     async def request_shutdown(self) -> dict[str, Any]:
+        """发起优雅停机：放完当前工作，再拒绝新的写操作。"""
         if self.shutdown_requested:
             self._finalize_shutdown_if_idle()
             return {
@@ -173,6 +182,7 @@ class TaskManager:
         }
 
     async def _worker(self) -> None:
+        """持续消费任务队列，并把任务级异常落到数据库。"""
         while True:
             task_id = await self.queue.get()
             try:
@@ -192,6 +202,7 @@ class TaskManager:
                 self.queue.task_done()
 
     async def _process_task(self, task_id: str) -> None:
+        """只处理 queued 图片，从而支持从指定失败页继续跑。"""
         task = self.database.get_task(task_id)
         if not task:
             return
@@ -237,6 +248,7 @@ class TaskManager:
                     return
 
                 if image["status"] != "queued":
+                    # 从更后的失败点续跑时，已完成页和更早的失败页都保持原状。
                     continue
 
                 image_id = image["id"]
@@ -244,6 +256,7 @@ class TaskManager:
                 last_stage: str | None = None
 
                 async def progress(stage: str, fraction: float):
+                    """把单图进度折算成整个任务的总进度。"""
                     nonlocal last_stage
                     overall = (processed + fraction) / total
                     self.database.update_image(
@@ -268,6 +281,7 @@ class TaskManager:
                     message: str,
                     details: dict[str, Any] | None,
                 ):
+                    """把引擎和翻译器日志挂到当前正在处理的图片上。"""
                     self.database.log(
                         task_id,
                         level,
@@ -343,6 +357,8 @@ class TaskManager:
 
             latest_task = self.database.get_task(task_id)
             latest_images = latest_task["images"] if latest_task else []
+            # 最终状态按整任务所有图片汇总，而不是只看这一次运行结果，
+            # 这样多次续跑后仍能准确反映还剩多少失败页。
             successful = sum(1 for image in latest_images if image["status"] == "completed")
             unresolved = len(latest_images) - successful
             status = "completed" if unresolved == 0 else "completed_with_errors"
@@ -368,6 +384,7 @@ class TaskManager:
     async def rerender_image(
         self, image: dict[str, Any], updates: list[dict[str, Any]]
     ) -> list[dict[str, Any]]:
+        """使用已保存的干净底图重新嵌字。"""
         self.active_manual_edits += 1
         try:
             async with self.model_lock:
@@ -390,11 +407,13 @@ class TaskManager:
         changed_indices: list[int],
         mask_changed_indices: list[int] | None = None,
     ) -> list[dict[str, Any]]:
+        """针对人工改动过的 OCR 框重新执行 OCR、翻译和去字。"""
         task = self.database.get_task(image["task_id"])
         if not task:
             raise RuntimeError("图片所属任务不存在")
 
         async def progress(stage: str, fraction: float):
+            """人工编辑只更新当前图片进度，不影响批任务总进度。"""
             self.database.update_image(
                 image["id"], status="running", stage=stage, progress=fraction
             )

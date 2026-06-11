@@ -1,3 +1,5 @@
+"""连接本地 Web 应用与 vendored manga-image-translator 核心的桥接层。"""
+
 from __future__ import annotations
 
 import asyncio
@@ -50,11 +52,15 @@ MIN_MASK_DILATION_OFFSET = 0
 MAX_MASK_DILATION_OFFSET = 40
 
 
+# 核心导入与运行时辅助函数
 class CoreUnavailableError(RuntimeError):
+    """当 vendored 图像流水线缺失或未安装完成时抛出。"""
+
     pass
 
 
 def _import_core():
+    """延迟导入 vendored 核心，并把模型目录钉到本地路径。"""
     if not (VENDOR_CORE_DIR / "manga_translator" / "__init__.py").exists():
         raise CoreUnavailableError(
             "漫画处理核心不存在，请运行“首次安装.command”初始化 Git 子模块"
@@ -103,6 +109,7 @@ def _import_core():
 
 
 def _font_path() -> str:
+    """为自动嵌字选择一个支持中日韩字符的字体。"""
     candidates = [
         VENDOR_CORE_DIR / "fonts" / "NotoSansMonoCJK-VF.ttf.ttc",
         Path("/System/Library/Fonts/Hiragino Sans GB.ttc"),
@@ -223,6 +230,7 @@ async def _reset_model_caches_for_cpu() -> None:
 
 
 def trim_runtime_memory(release_accelerator_cache: bool = True) -> None:
+    """在页面之间释放大数组和加速器缓存，减少内存占用。"""
     gc.collect()
     if not release_accelerator_cache:
         return
@@ -242,12 +250,14 @@ def trim_runtime_memory(release_accelerator_cache: bool = True) -> None:
 
 
 def _copy_image_array(image: Any) -> np.ndarray | None:
+    """返回连续内存副本，因为底层核心会原地修改图像数组。"""
     if image is None:
         return None
     return np.ascontiguousarray(np.array(image, copy=True))
 
 
 def _clip_bbox(bbox: Any, width: int, height: int) -> list[int]:
+    """把用户给出的框裁到图像边界内，并拒绝过小的无效框。"""
     if bbox is None or len(bbox) != 4:
         raise ValueError("文本框坐标必须包含 4 个数值")
     x1, y1, x2, y2 = [int(round(float(value))) for value in bbox]
@@ -276,6 +286,7 @@ def _update_bbox_fields(region: Any, ocr_bbox: list[int], render_bbox: list[int]
 
 
 def _clear_geometry_cache(region: Any) -> None:
+    """在修改框、角度或排版字段后，清空缓存的几何信息。"""
     for name in (
         "xyxy",
         "xywh",
@@ -328,6 +339,7 @@ def _region_font_preference(region: Any) -> int | None:
 def _normalize_region_updates(
     updates: list[dict[str, Any]], width: int, height: int
 ) -> list[dict[str, Any]]:
+    """校验编辑器提交内容，并整理成核心对象可用的框结构。"""
     normalized: list[dict[str, Any]] = []
     for new_index, update in enumerate(updates):
         fallback = update.get("bbox") or update.get("render_bbox") or update.get("ocr_bbox")
@@ -357,6 +369,7 @@ def _normalize_region_updates(
 def _fill_update_bbox_defaults(
     updates: list[dict[str, Any]], existing_regions: list[Any]
 ) -> list[dict[str, Any]]:
+    """给旧版前端提交补齐缺失字段，来源是已保存的 region。"""
     result: list[dict[str, Any]] = []
     for index, update in enumerate(updates):
         item = dict(update)
@@ -421,6 +434,7 @@ def _prepare_region_for_render(
     direction: str | None = None,
     alignment: str | None = None,
 ) -> None:
+    """给 region 挂上 vendored 文本渲染器需要的排版参数。"""
     region.target_lang = _config_target_lang(config)
     selected_direction = (
         direction
@@ -452,6 +466,7 @@ def _load_text_render():
 
 
 def _fit_region_font_size(region: Any, config: Any) -> int:
+    """二分查找仍能塞进渲染框的最大字号。"""
     preferred = _region_font_preference(region)
     width, height = getattr(region, "unrotated_size", (0, 0))
     width = max(2, int(round(width)))
@@ -521,6 +536,7 @@ def _make_text_region(
     mask_dilation_offset: int = DEFAULT_MASK_DILATION_OFFSET,
     angle: float = 0,
 ) -> Any:
+    """为新建的人工 OCR 区域构造核心 TextBlock 对象。"""
     block = core["TextBlock"](
         [_bbox_to_polygon(bbox)],
         texts=[text or ""],
@@ -541,6 +557,7 @@ def _make_text_region(
 def _make_mask_from_regions(
     shape: tuple[int, int, int] | tuple[int, int], regions: list[Any]
 ) -> np.ndarray:
+    """先用 OCR 框生成粗略文本掩膜，再交给后续细化。"""
     height, width = shape[:2]
     mask = np.zeros((height, width), dtype=np.uint8)
     for region in regions:
@@ -557,6 +574,7 @@ async def _run_mask_refinement_by_region_offsets(
     image: np.ndarray,
     regions: list[Any],
 ) -> np.ndarray:
+    """按不同膨胀偏移分组细化掩膜，让每个区域都能用自己的去字范围。"""
     height, width = image.shape[:2]
     combined = np.zeros((height, width), dtype=np.uint8)
     groups: dict[int, list[Any]] = {}
@@ -598,6 +616,7 @@ async def _run_mask_refinement_by_region_offsets(
 
 
 def _ensure_payload_region_boxes(payload: dict[str, Any]) -> dict[str, Any]:
+    """在人工编辑读取上下文前，规范化已保存 payload 里的框字段。"""
     width, height = _image_size_from_payload(payload)
     config = payload.get("config")
     for region in payload.get("text_regions", []) or []:
@@ -620,6 +639,7 @@ def _extract_gimp_clean_image(ctx: Any) -> np.ndarray | None:
 
 
 def _extract_clean_inpainted_image(ctx: Any) -> np.ndarray:
+    """从核心上下文里取出当前能拿到的最佳干净底图。"""
     gimp_clean = _extract_gimp_clean_image(ctx)
     if gimp_clean is not None:
         return gimp_clean
@@ -648,6 +668,7 @@ def _image_array_for_png(image: Any) -> np.ndarray | None:
 
 
 def _save_clean_sidecar(context_path: Path, image: Any) -> None:
+    """把干净底图单独落成 sidecar 文件，避免以后只依赖 pickle。"""
     clean = _image_array_for_png(image)
     if clean is None:
         return
@@ -671,6 +692,7 @@ def _load_clean_sidecar(context_path: Path, expected_shape: tuple[int, ...]) -> 
 
 
 def _build_minimal_rerender_payload(ctx: Any, config: Any) -> dict[str, Any]:
+    """即使页面没有文本区域，也保存足够上下文供后续编辑。"""
     payload = {
         "config": config,
         "text_regions": list(getattr(ctx, "text_regions", []) or []),
@@ -683,6 +705,7 @@ def _build_minimal_rerender_payload(ctx: Any, config: Any) -> dict[str, Any]:
 
 
 def _build_rerender_payload(ctx: Any, config: Any) -> dict[str, Any]:
+    """保存后续人工编辑需要的干净底图和文本区域信息。"""
     text_regions = list(getattr(ctx, "text_regions", []) or [])
     if not text_regions:
         return _build_minimal_rerender_payload(ctx, config)
@@ -709,6 +732,7 @@ def _build_rerender_payload(ctx: Any, config: Any) -> dict[str, Any]:
 def _normalize_rerender_payload(
     payload: dict[str, Any], context_path: Path | None = None
 ) -> dict[str, Any]:
+    """兼容读取旧版与当前版本的上下文 pickle 格式。"""
     if "ctx" in payload:
         legacy_ctx = payload["ctx"]
         normalized = _build_rerender_payload(legacy_ctx, payload["config"])
@@ -727,6 +751,7 @@ def _normalize_rerender_payload(
 
 
 def _save_rerender_payload(context_path: Path, payload: dict[str, Any]) -> None:
+    """在处理或重嵌后写回编辑上下文和干净底图 sidecar。"""
     context_path.parent.mkdir(parents=True, exist_ok=True)
     payload = dict(payload)
     clean = _image_array_for_png(payload.get("img_inpainted"))
@@ -745,6 +770,7 @@ async def _rebuild_clean_inpainted_image(
     payload: dict[str, Any],
     regions: list[Any],
 ) -> np.ndarray:
+    """当 OCR 框或掩膜变化时，重新生成干净底图。"""
     enabled_regions = [region for region in regions if _region_enabled(region)]
     if not enabled_regions:
         return _copy_image_array(payload["img_rgb"])
@@ -776,6 +802,7 @@ async def _clean_inpainted_for_rerender(
     payload: dict[str, Any],
     regions: list[Any],
 ) -> np.ndarray:
+    """优先复用可信干净底图，否则根据 OCR 框重新生成。"""
     if payload.get("clean_image_trusted"):
         clean = _image_array_for_png(payload.get("img_inpainted"))
         if clean is not None:
@@ -784,6 +811,7 @@ async def _clean_inpainted_for_rerender(
 
 
 def serialize_regions(regions: list[Any]) -> list[dict[str, Any]]:
+    """把核心 TextBlock 对象转成浏览器编辑器使用的 JSON。"""
     result: list[dict[str, Any]] = []
     for index, region in enumerate(regions or []):
         foreground, outline = region.get_font_colors()
@@ -829,6 +857,8 @@ def _save_image(image: Image.Image, path: Path) -> None:
 
 
 class CoreEngine:
+    """供批任务与人工 OCR 编辑共用的高层图像流水线。"""
+
     def __init__(
         self,
         provider: TranslatorProvider,
@@ -857,6 +887,7 @@ class CoreEngine:
         self.translation_cache: dict[tuple[str, ...], list[str]] = {}
 
     def _build(self, use_gpu: bool):
+        """构造一个打过补丁的 MangaTranslator 子类，并接管翻译环节。"""
         core = _import_core()
         provider = self.provider
         source = self.source_language
@@ -870,15 +901,17 @@ class CoreEngine:
             polish.set_log_callback(log_callback)
 
         class WebMangaTranslator(base_class):
+            """替换文件日志和内部翻译逻辑的核心适配器。"""
+
             def _setup_log_file(self):
                 self._log_file_path = None
 
             async def _detector_cleanup_job(self):
-                # Upstream loops forever even when TTL is disabled.
+                # 上游这里即使禁用 TTL 也会一直循环，本地应用不需要它。
                 return
 
             async def _run_detection(self, config, ctx):
-                # The installed CTD ONNX model uses the CPU backend.
+                # 当前安装的 CTD ONNX 模型走 CPU 后端，强制切过去更稳定。
                 device = self.device
                 self.device = "cpu"
                 try:
@@ -887,6 +920,7 @@ class CoreEngine:
                     self.device = device
 
             async def _dispatch_with_context(self, config, texts, ctx):
+                """通过当前任务选中的翻译提供方处理 OCR 文本。"""
                 await log_callback(
                     "INFO",
                     "ocr",
@@ -945,6 +979,7 @@ class CoreEngine:
         return core, translator
 
     def _config(self, core, use_gpu: bool):
+        """把 Web 任务参数映射成 vendored 核心配置对象。"""
         return core["Config"](
             detector={
                 "detector": core["Detector"].ctd,
@@ -979,6 +1014,7 @@ class CoreEngine:
         )
 
     def _join_manual_ocr_texts(self, texts: list[str]) -> str:
+        """按源语言阅读顺序把 OCR 多行文本拼成一段。"""
         cleaned = [text.strip() for text in texts if text and text.strip()]
         if self.source_language == "ja":
             return "".join(cleaned)
@@ -1008,6 +1044,7 @@ class CoreEngine:
         return matched / len(old_units)
 
     def _manual_ocr_is_low_quality(self, new_text: str, old_text: str | None) -> bool:
+        """识别明显变差的 OCR 结果，以便保留旧文本。"""
         old_clean = (old_text or "").strip()
         if not old_clean:
             return False
@@ -1037,6 +1074,7 @@ class CoreEngine:
     def _manual_ocr_should_replace_candidate(
         self, new_text: str, current_text: str, old_text: str | None = None
     ) -> bool:
+        """结合文本长度、召回率和脏字符判断该不该替换 OCR 候选。"""
         new_clean = (new_text or "").strip()
         if not new_clean:
             return False
@@ -1092,6 +1130,7 @@ class CoreEngine:
         crop_origin: tuple[int, int],
         image_shape: tuple[int, ...],
     ) -> list[Any]:
+        """只保留真正落在用户框内的检测文本行。"""
         if not textlines:
             return []
         ux1, uy1, ux2, uy2 = user_bbox
@@ -1112,6 +1151,7 @@ class CoreEngine:
     def _manual_ocr_tight_text_bbox(
         self, image: np.ndarray, bbox: list[int]
     ) -> list[int] | None:
+        """在 OCR 兜底前，先尝试把高长框收紧到真实墨迹附近。"""
         height, width = image.shape[:2]
         x1, y1, x2, y2 = _clip_bbox(bbox, width, height)
         box_width = x2 - x1
@@ -1179,6 +1219,7 @@ class CoreEngine:
     def _manual_ocr_vertical_column_bboxes(
         self, image: np.ndarray, bbox: list[int], expand_ratio: float = 0.0
     ) -> list[list[int]]:
+        """把疑似日文竖排文本拆成列，提升 OCR 质量。"""
         if self.source_language != "ja":
             return []
         height, width = image.shape[:2]
@@ -1356,6 +1397,7 @@ class CoreEngine:
         bbox: list[int],
         old_text: str | None = None,
     ) -> tuple[str, tuple[Any, Any] | None]:
+        """对一个用户编辑框执行整套人工 OCR 策略链。"""
         height, width = image.shape[:2]
         x1, y1, x2, y2 = _clip_bbox(bbox, width, height)
         pad = max(4, int(round(max(x2 - x1, y2 - y1) * 0.04)))
@@ -1538,6 +1580,7 @@ class CoreEngine:
         return text, colors
 
     async def _translate_manual_texts(self, texts: list[str]) -> list[str]:
+        """翻译重新 OCR 出来的人工框文本，并缓存重复请求。"""
         if not texts:
             return []
         self.provider.set_log_callback(self.log_callback)
@@ -1578,6 +1621,7 @@ class CoreEngine:
         context_path: Path,
         regions_path: Path,
     ) -> list[dict[str, Any]]:
+        """执行整页流水线，并对已知 MPS 问题自动回退 CPU 重试。"""
         use_gpu = _mps_available()
         try:
             return await self._process_once(
@@ -1616,6 +1660,7 @@ class CoreEngine:
         changed_indices: list[int],
         mask_changed_indices: list[int] | None = None,
     ) -> list[dict[str, Any]]:
+        """只重跑被编辑过的 OCR 框，并沿用同样的 MPS 到 CPU 回退逻辑。"""
         use_gpu = _mps_available()
         try:
             return await self._reprocess_regions_once(
@@ -1657,6 +1702,7 @@ class CoreEngine:
         regions_path: Path,
         use_gpu: bool,
     ) -> list[dict[str, Any]]:
+        """执行一次完整核心翻译流程，并保存后续编辑所需产物。"""
         core, translator = self._build(use_gpu)
         config = self._config(core, use_gpu)
         image = None
@@ -1718,6 +1764,7 @@ class CoreEngine:
         mask_changed_indices: list[int],
         use_gpu: bool,
     ) -> list[dict[str, Any]]:
+        """应用编辑器更新，可选重做 OCR，然后重建输出结果。"""
         core, translator = self._build(use_gpu)
         config = self._config(core, use_gpu)
         with context_path.open("rb") as file:
@@ -1884,6 +1931,7 @@ async def rerender(
     input_path: Path,
     updates: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
+    """在不重跑 OCR 和翻译的前提下，仅重做嵌字。"""
     core = _import_core()
     with context_path.open("rb") as file:
         payload = _normalize_rerender_payload(pickle.load(file), context_path)
