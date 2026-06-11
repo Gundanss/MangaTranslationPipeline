@@ -40,6 +40,7 @@ from .providers import (
 from .schemas import (
     ReprocessRegionsRequest,
     RerenderRequest,
+    ResumeFromImageRequest,
     SettingsUpdate,
     TaskConfig,
     TranslateRegionRequest,
@@ -143,6 +144,86 @@ def _normalize_region_json(regions: list[dict]) -> tuple[list[dict], bool]:
             changed = True
         normalized.append(item)
     return normalized, changed
+
+
+def _count_non_queued_images(images: list[dict], reset_ids: set[str] | None = None) -> int:
+    blocked = reset_ids or set()
+    return sum(
+        1
+        for image in images
+        if image["id"] not in blocked and image.get("status") != "queued"
+    )
+
+
+async def _resume_task_from_image(
+    task_id: str,
+    image_id: str,
+    requested_by: str,
+) -> dict:
+    task = database.get_task(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="任务不存在")
+
+    image = database.get_image(image_id)
+    if not image or image["task_id"] != task_id:
+        raise HTTPException(status_code=404, detail="图片不存在")
+
+    if task["status"] not in {"failed", "completed_with_errors", "stopped"}:
+        raise HTTPException(status_code=409, detail="只有已失败、部分失败或已停止的任务才能续跑")
+
+    target_index = next(
+        (index for index, item in enumerate(task["images"]) if item["id"] == image_id),
+        None,
+    )
+    if target_index is None:
+        raise HTTPException(status_code=404, detail="图片不属于当前任务")
+
+    reset_ids: set[str] = set()
+    for current in task["images"][target_index:]:
+        if current["status"] == "completed":
+            continue
+        database.update_image(
+            current["id"],
+            status="queued",
+            stage="retry",
+            progress=0.0,
+            error=None,
+        )
+        reset_ids.add(current["id"])
+
+    if not reset_ids:
+        raise HTTPException(status_code=409, detail="所选页面及其后续没有可续跑的失败或未完成图片")
+
+    total = max(1, task["total_files"])
+    processed = _count_non_queued_images(task["images"], reset_ids)
+    details = {
+        "requested_by": requested_by,
+        "start_image_id": image_id,
+        "start_image_path": image["relative_path"],
+        "requeued_image_ids": sorted(reset_ids),
+        "requeued_count": len(reset_ids),
+    }
+    database.update_task(
+        task_id,
+        status="queued",
+        current_stage="retry",
+        completed_files=processed,
+        progress=processed / total,
+        error=None,
+    )
+    database.log(
+        task_id,
+        "INFO",
+        "retry",
+        f"{requested_by} 触发从 {image['relative_path']} 开始续跑，重新排队 {len(reset_ids)} 张图片",
+        image_id=image_id,
+        details=details,
+    )
+    await manager.enqueue(task_id)
+    resumed = database.get_task(task_id)
+    if not resumed:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    return resumed
 
 
 async def _validate_config(config: TaskConfig) -> None:
@@ -328,6 +409,21 @@ async def get_task(task_id: str):
     if not task:
         raise HTTPException(status_code=404, detail="任务不存在")
     return _task_public(task)
+
+
+@app.post("/api/tasks/{task_id}/resume-from-image")
+async def resume_task_from_image(
+    task_id: str,
+    request: ResumeFromImageRequest,
+    client_request: Request,
+):
+    _ensure_service_writable()
+    resumed = await _resume_task_from_image(
+        task_id,
+        request.image_id,
+        client_request.client.host if client_request.client else "unknown",
+    )
+    return _task_public(resumed)
 
 
 @app.get("/api/tasks/{task_id}/events")

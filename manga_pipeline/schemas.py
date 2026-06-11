@@ -73,3 +73,7 @@ class ReprocessRegionsRequest(BaseModel):
 class TranslateRegionRequest(BaseModel):
     mode: TranslateRegionMode
     text: str = Field(min_length=1)
+
+
+class ResumeFromImageRequest(BaseModel):
+    image_id: str = Field(min_length=1)

@@ -104,6 +104,8 @@ class TaskManager:
     ) -> int:
         stopped_count = 0
         for image in images[start_index:]:
+            if image.get("status") != "queued":
+                continue
             self.database.update_image(
                 image["id"],
                 status="stopped",
@@ -195,13 +197,18 @@ class TaskManager:
             return
         self.active_task_id = task_id
         config = task["config"]
+        total = max(1, task["total_files"])
+        processed = sum(1 for image in task["images"] if image["status"] != "queued")
         self.database.update_task(
-            task_id, status="running", current_stage="starting", error=None
+            task_id,
+            status="running",
+            current_stage="starting",
+            completed_files=processed,
+            progress=processed / total,
+            error=None,
         )
         self.database.log(task_id, "INFO", "starting", "任务开始处理")
         failures = 0
-        total = max(1, task["total_files"])
-        processed = 0
 
         try:
             for index, image in enumerate(task["images"]):
@@ -228,6 +235,9 @@ class TaskManager:
                             error="服务手动停止",
                         )
                     return
+
+                if image["status"] != "queued":
+                    continue
 
                 image_id = image["id"]
                 self.active_image_id = image_id
@@ -331,19 +341,24 @@ class TaskManager:
                         )
                         return
 
-            status = "completed_with_errors" if failures else "completed"
+            latest_task = self.database.get_task(task_id)
+            latest_images = latest_task["images"] if latest_task else []
+            successful = sum(1 for image in latest_images if image["status"] == "completed")
+            unresolved = len(latest_images) - successful
+            status = "completed" if unresolved == 0 else "completed_with_errors"
             self.database.update_task(
                 task_id,
                 status=status,
                 current_stage="finished",
                 progress=1.0,
-                error=f"{failures} 张图片处理失败" if failures else None,
+                completed_files=len(latest_images),
+                error=f"{unresolved} 张图片未成功处理" if unresolved else None,
             )
             self.database.log(
                 task_id,
-                "WARNING" if failures else "INFO",
+                "WARNING" if unresolved else "INFO",
                 "finished",
-                f"任务完成：成功 {task['total_files'] - failures}，失败 {failures}",
+                f"任务完成：成功 {successful}，未成功 {unresolved}",
             )
         finally:
             self.active_image_id = None

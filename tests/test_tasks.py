@@ -187,3 +187,78 @@ def test_shutdown_finishes_current_image_then_stops_remaining_images(tmp_path):
     assert database.tasks["task-1"]["status"] == "stopped"
     assert database.images["image-1"]["status"] == "completed"
     assert database.images["image-2"]["status"] == "stopped"
+
+
+def test_resume_run_processes_only_requeued_images_and_keeps_old_failures(tmp_path):
+    processed = []
+    database = FakeDatabase(
+        {
+            "task-1": [
+                ("image-1", tmp_path / "image-1.png"),
+                ("image-2", tmp_path / "image-2.png"),
+                ("image-3", tmp_path / "image-3.png"),
+                ("image-4", tmp_path / "image-4.png"),
+            ]
+        }
+    )
+    database.tasks["task-1"].update(
+        {"status": "completed_with_errors", "completed_files": 2, "progress": 0.5}
+    )
+    database.images["image-1"].update(status="failed", stage="error", error="old failure")
+    database.images["image-2"].update(status="completed", stage="saved", progress=1.0)
+    database.images["image-3"].update(status="queued", stage="retry", progress=0.0, error=None)
+    database.images["image-4"].update(status="completed", stage="saved", progress=1.0)
+
+    manager = TaskManager(database, FakeSecrets())
+
+    class FakeEngine:
+        async def process(self, input_path, *_args):
+            processed.append(Path(input_path).stem)
+            return []
+
+    manager._build_engine = lambda *_args: FakeEngine()
+
+    asyncio.run(manager._process_task("task-1"))
+
+    assert processed == ["image-3"]
+    assert database.images["image-1"]["status"] == "failed"
+    assert database.images["image-2"]["status"] == "completed"
+    assert database.images["image-3"]["status"] == "completed"
+    assert database.images["image-4"]["status"] == "completed"
+    assert database.tasks["task-1"]["status"] == "completed_with_errors"
+    assert database.tasks["task-1"]["completed_files"] == 4
+    assert database.tasks["task-1"]["error"] == "1 张图片未成功处理"
+
+
+def test_stop_task_only_marks_queued_images_when_resuming(tmp_path):
+    database = FakeDatabase(
+        {
+            "task-1": [
+                ("image-1", tmp_path / "image-1.png"),
+                ("image-2", tmp_path / "image-2.png"),
+                ("image-3", tmp_path / "image-3.png"),
+            ]
+        }
+    )
+    manager = TaskManager(database, FakeSecrets())
+    images = database.get_task("task-1")["images"]
+    database.images["image-1"]["status"] = "completed"
+    database.images["image-3"]["status"] = "failed"
+    images[0]["status"] = "completed"
+    images[1]["status"] = "queued"
+    images[2]["status"] = "failed"
+
+    stopped = manager._stop_task(
+        "task-1",
+        images,
+        start_index=0,
+        completed_files=1,
+        progress=1 / 3,
+        reason="stop",
+        log_message="stop",
+    )
+
+    assert stopped == 1
+    assert database.images["image-1"]["status"] == "completed"
+    assert database.images["image-2"]["status"] == "stopped"
+    assert database.images["image-3"]["status"] == "failed"

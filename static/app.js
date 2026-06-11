@@ -19,6 +19,7 @@ const state = {
   serverStopping: false,
   serverStopped: false,
   shutdownPoll: null,
+  resumeImageId: null,
 };
 
 const stageNames = {
@@ -304,6 +305,12 @@ function isImageEditable(image) {
   return image?.status === "completed";
 }
 
+function canResumeImage(image) {
+  const taskStatus = state.activeTask?.status;
+  return ["failed", "completed_with_errors", "stopped"].includes(taskStatus)
+    && ["failed", "stopped", "queued"].includes(image?.status);
+}
+
 function syncActiveImageFromTask() {
   if (!state.activeTask || !state.activeImage) return;
   const latest = (state.activeTask.images || []).find((image) => image.id === state.activeImage.id);
@@ -316,20 +323,39 @@ function renderImageStrip(images) {
   const strip = $("imageStrip");
   if (!images.length) {
     strip.className = "image-strip empty-state";
-    strip.textContent = "完成的图片会显示在这里";
+    strip.textContent = "任务图片会显示在这里";
     return;
   }
   strip.className = "image-strip";
   strip.innerHTML = "";
   images.forEach((image) => {
-    const button = document.createElement("button");
-    button.className = `image-card ${state.activeImage?.id === image.id ? "active" : ""}`;
+    const card = document.createElement("article");
+    card.className = `image-card ${state.activeImage?.id === image.id ? "active" : ""}`;
     const editable = isImageEditable(image);
-    button.innerHTML = `<strong>${escapeHtml(image.relative_path)}</strong>
-      <small>${editable ? "可校正" : `${stageNames[image.stage] || image.stage} ${Math.round(image.progress * 100)}%`}</small>`;
-    button.disabled = !editable;
-    button.onclick = () => openImage(image);
-    strip.append(button);
+    const resumable = canResumeImage(image);
+    const statusText = editable
+      ? "可校正"
+      : `${stageNames[image.stage] || image.stage} ${Math.round(image.progress * 100)}%`;
+    card.innerHTML = `<strong>${escapeHtml(image.relative_path)}</strong>
+      <small>${statusText}</small>`;
+    if (editable) {
+      const action = document.createElement("button");
+      action.className = "button secondary mini";
+      action.type = "button";
+      action.textContent = "打开校正";
+      action.disabled = state.serverStopping || state.serverStopped;
+      action.onclick = () => openImage(image);
+      card.append(action);
+    } else if (resumable) {
+      const action = document.createElement("button");
+      action.className = "button primary mini";
+      action.type = "button";
+      action.textContent = state.resumeImageId === image.id ? "续跑中..." : "从此页续跑";
+      action.disabled = !!state.resumeImageId || state.serverStopping || state.serverStopped;
+      action.onclick = () => resumeTaskFromImage(image);
+      card.append(action);
+    }
+    strip.append(card);
   });
 }
 
@@ -851,6 +877,36 @@ async function rerenderImage() {
     $("editorMessage").textContent = error.message;
   } finally {
     $("rerenderButton").disabled = state.serverStopping || state.serverStopped;
+  }
+}
+
+async function resumeTaskFromImage(image) {
+  if (state.serverStopping || state.serverStopped) {
+    $("formMessage").textContent = "服务已停止，重新启动后才能续跑失败页面";
+    return;
+  }
+  if (!state.activeTask || !canResumeImage(image) || state.resumeImageId) return;
+  state.resumeImageId = image.id;
+  $("formMessage").textContent = "";
+  renderImageStrip(state.activeTask.images || []);
+  try {
+    const task = await api(`/api/tasks/${state.activeTask.id}/resume-from-image`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ image_id: image.id }),
+    });
+    state.activeTask = task;
+    if (state.activeTask?.id !== task.id || !state.eventSource) {
+      activateTask(task.id);
+    } else {
+      renderTask();
+    }
+    await loadTasks();
+  } catch (error) {
+    $("formMessage").textContent = error.message;
+  } finally {
+    state.resumeImageId = null;
+    if (state.activeTask) renderImageStrip(state.activeTask.images || []);
   }
 }
 
