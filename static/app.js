@@ -34,6 +34,8 @@ const statusNames = {
   queued: "排队中", running: "处理中", completed: "已完成",
   completed_with_errors: "部分失败", failed: "失败", stopped: "已停止", idle: "空闲",
 };
+const ROTATION_SNAP_TARGETS = [0, 90, -90, 180];
+const ROTATION_SNAP_THRESHOLD = 6;
 
 async function api(url, options = {}) {
   const response = await fetch(url, options);
@@ -363,6 +365,20 @@ function normalizeRegionAngle(value) {
   return Math.round(angle * 10) / 10;
 }
 
+function snapRegionAngle(value) {
+  const angle = normalizeRegionAngle(value);
+  let snapped = angle;
+  let minDistance = ROTATION_SNAP_THRESHOLD + 1;
+  ROTATION_SNAP_TARGETS.forEach((target) => {
+    const distance = Math.abs(normalizeRegionAngle(angle - target));
+    if (distance <= ROTATION_SNAP_THRESHOLD && distance < minDistance) {
+      snapped = target;
+      minDistance = distance;
+    }
+  });
+  return normalizeRegionAngle(snapped);
+}
+
 function ensureRegionShape(region, index) {
   const fallback = region.render_bbox || region.ocr_bbox || region.bbox || [0, 0, 80, 80];
   region.index = index;
@@ -551,7 +567,7 @@ function renderOverlays() {
       const angleRad = region.angle * Math.PI / 180;
       const centerX = x1 * scaleX + width / 2;
       const centerY = y1 * scaleY + height / 2;
-      const offset = Math.max(height / 2 + 36, 46);
+      const offset = Math.max(height / 2 + 28, 38);
       rotate.className = "rotate-handle";
       rotate.title = "拖拽旋转译文框";
       rotate.style.left = `${centerX + Math.sin(angleRad) * offset}px`;
@@ -599,7 +615,8 @@ function moveBoxDrag(event) {
   if (handle === "rotate") {
     const centerX = (x1 + x2) / 2;
     const centerY = (y1 + y2) / 2;
-    setRegionAngle(region, Math.atan2(point.y - centerY, point.x - centerX) * 180 / Math.PI + 90);
+    const rawAngle = Math.atan2(point.y - centerY, point.x - centerX) * 180 / Math.PI + 90;
+    setRegionAngle(region, snapRegionAngle(rawAngle));
   } else if (!handle) {
     x1 += dx; x2 += dx; y1 += dy; y2 += dy;
   } else {

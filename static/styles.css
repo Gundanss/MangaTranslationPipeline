@@ -320,8 +320,8 @@ small, .muted { color: var(--muted); font-size: 11px; }
 .resize-handle.w { left: -6px; top: 50%; transform: translateY(-50%); cursor: ew-resize; }
 .rotate-handle {
   position: absolute;
-  width: 18px;
-  height: 18px;
+  width: 14px;
+  height: 14px;
   border: 2px solid #ffffff;
   border-radius: 50%;
   background: #ffcc4d;
@@ -329,15 +329,15 @@ small, .muted { color: var(--muted); font-size: 11px; }
   cursor: grab;
   z-index: 7;
   touch-action: none;
-  box-shadow: 0 0 0 2px rgba(29,29,27,.72), 0 2px 10px rgba(0,0,0,.45);
+  box-shadow: 0 0 0 1px rgba(29,29,27,.72), 0 2px 8px rgba(0,0,0,.4);
 }
 .rotate-handle::after {
   content: "";
   position: absolute;
   left: 50%;
-  top: 16px;
-  width: 3px;
-  height: 24px;
+  top: 12px;
+  width: 2px;
+  height: 18px;
   border-radius: 999px;
   background: #ffcc4d;
   transform: translateX(-50%);
