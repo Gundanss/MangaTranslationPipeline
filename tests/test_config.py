@@ -75,9 +75,15 @@ def test_region_update_mask_dilation_defaults_and_bounds():
         "outline": "#FFFFFF",
     }
     assert RegionUpdate(**base).mask_dilation_offset == 20
+    assert RegionUpdate(**base).angle == 0
+    assert RegionUpdate(**{**base, "angle": -12.5}).angle == -12.5
     assert RegionUpdate(**{**base, "mask_dilation_offset": 0}).mask_dilation_offset == 0
     assert RegionUpdate(**{**base, "mask_dilation_offset": 40}).mask_dilation_offset == 40
     with pytest.raises(ValueError):
         RegionUpdate(**{**base, "mask_dilation_offset": -1})
     with pytest.raises(ValueError):
         RegionUpdate(**{**base, "mask_dilation_offset": 41})
+    with pytest.raises(ValueError):
+        RegionUpdate(**{**base, "angle": -181})
+    with pytest.raises(ValueError):
+        RegionUpdate(**{**base, "angle": 181})

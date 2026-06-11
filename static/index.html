@@ -241,6 +241,12 @@
                       <input id="regionFontSize" type="number" min="6" max="300" placeholder="自动适配文本框" />
                     </label>
                     <label class="field">
+                      <span>角度</span>
+                      <input id="regionAngle" type="number" min="-180" max="180" step="1" />
+                    </label>
+                  </div>
+                  <div class="grid-two">
+                    <label class="field">
                       <span>方向</span>
                       <select id="regionDirection">
                         <option value="auto">自动</option>
@@ -248,8 +254,6 @@
                         <option value="vertical">竖排</option>
                       </select>
                     </label>
-                  </div>
-                  <div class="grid-two">
                     <label class="field">
                       <span>对齐</span>
                       <select id="regionAlignment">
@@ -259,6 +263,8 @@
                         <option value="right">右对齐</option>
                       </select>
                     </label>
+                  </div>
+                  <div class="grid-two">
                     <div class="color-fields">
                       <label><span>文字</span><input id="regionForeground" type="color" /></label>
                       <label><span>描边</span><input id="regionOutline" type="color" /></label>
