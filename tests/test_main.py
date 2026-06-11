@@ -47,6 +47,20 @@ def test_health_reports_shutdown_flag(monkeypatch):
     assert response.json()["shutting_down"] is True
 
 
+def test_index_disables_cache():
+    response = asyncio.run(request_json("/"))
+
+    assert response.status_code == 200
+    assert response.headers["cache-control"] == "no-store"
+
+
+def test_static_assets_disable_cache():
+    response = asyncio.run(request_json("/static/app.js"))
+
+    assert response.status_code == 200
+    assert response.headers["cache-control"] == "no-store"
+
+
 def test_shutdown_route_rejects_non_local_requests():
     request = SimpleNamespace(client=SimpleNamespace(host="10.0.0.8"))
 
@@ -128,6 +142,7 @@ def test_normalize_region_json_adds_default_mask_dilation():
 
     assert changed is True
     assert regions[0]["mask_dilation_offset"] == 20
+    assert regions[0]["angle"] == 0
 
 
 class FakeDatabase:

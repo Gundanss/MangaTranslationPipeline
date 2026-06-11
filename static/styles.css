@@ -289,6 +289,9 @@ small, .muted { color: var(--muted); font-size: 11px; }
   font-weight: 800;
   text-shadow: 0 1px 2px #000;
   cursor: move;
+  overflow: visible;
+  transform-origin: center center;
+  z-index: 1;
 }
 .region-box.render {
   border-color: rgba(55,213,255,.95);
@@ -296,6 +299,7 @@ small, .muted { color: var(--muted); font-size: 11px; }
 }
 .region-box.disabled { opacity: .42; border-style: dashed; }
 .region-box:hover, .region-box.active { border-color: #37d5ff; background: rgba(55,213,255,.18); }
+.region-box.active { z-index: 5; }
 .region-box.render:hover, .region-box.render.active { border-color: #ffcc4d; background: rgba(255,204,77,.18); }
 .resize-handle {
   position: absolute;
@@ -304,6 +308,7 @@ small, .muted { color: var(--muted); font-size: 11px; }
   border: 1px solid #1d1d1b;
   background: #fff;
   pointer-events: auto;
+  z-index: 6;
 }
 .resize-handle.nw { left: -6px; top: -6px; cursor: nwse-resize; }
 .resize-handle.n { left: 50%; top: -6px; transform: translateX(-50%); cursor: ns-resize; }
@@ -313,6 +318,32 @@ small, .muted { color: var(--muted); font-size: 11px; }
 .resize-handle.s { left: 50%; bottom: -6px; transform: translateX(-50%); cursor: ns-resize; }
 .resize-handle.sw { left: -6px; bottom: -6px; cursor: nesw-resize; }
 .resize-handle.w { left: -6px; top: 50%; transform: translateY(-50%); cursor: ew-resize; }
+.rotate-handle {
+  position: absolute;
+  width: 14px;
+  height: 14px;
+  border: 2px solid #ffffff;
+  border-radius: 50%;
+  background: #ffcc4d;
+  pointer-events: auto;
+  cursor: grab;
+  z-index: 7;
+  touch-action: none;
+  box-shadow: 0 0 0 1px rgba(29,29,27,.72), 0 2px 8px rgba(0,0,0,.4);
+}
+.rotate-handle::after {
+  content: "";
+  position: absolute;
+  left: 50%;
+  top: 12px;
+  width: 2px;
+  height: 18px;
+  border-radius: 999px;
+  background: #ffcc4d;
+  transform: translateX(-50%);
+  box-shadow: 0 0 0 1px rgba(29,29,27,.72);
+}
+.rotate-handle:active { cursor: grabbing; }
 .region-editor { padding: 16px; border-left: 1px solid var(--line); background: var(--surface); }
 .editor-placeholder { color: var(--muted); font-size: 12px; padding: 30px 8px; text-align: center; }
 .region-title { margin-bottom: 12px; }
