@@ -355,6 +355,14 @@ function normalizeRegionAlignment(value) {
   return ["left", "center", "right"].includes(value) ? value : "left";
 }
 
+function normalizeRegionAngle(value) {
+  let angle = Number(value);
+  if (!Number.isFinite(angle)) angle = 0;
+  while (angle > 180) angle -= 360;
+  while (angle < -180) angle += 360;
+  return Math.round(angle * 10) / 10;
+}
+
 function ensureRegionShape(region, index) {
   const fallback = region.render_bbox || region.ocr_bbox || region.bbox || [0, 0, 80, 80];
   region.index = index;
@@ -369,6 +377,7 @@ function ensureRegionShape(region, index) {
   region.outline = region.outline || "#FFFFFF";
   region.text = region.text || "";
   region.translation = region.translation || "";
+  region.angle = normalizeRegionAngle(region.angle);
   region.mask_dilation_offset = normalizeMaskDilationOffset(region.mask_dilation_offset);
   return region;
 }
@@ -420,6 +429,10 @@ function setRegionBBox(region, bbox) {
     region.bbox = next;
   }
   updateBBoxInputs(region);
+}
+
+function setRegionAngle(region, angle) {
+  region.angle = normalizeRegionAngle(angle);
 }
 
 function editorImageUrl() {
@@ -507,6 +520,8 @@ function renderOverlays() {
   state.regions.forEach((region, index) => {
     ensureRegionShape(region, index);
     const [x1, y1, x2, y2] = getRegionBBox(region);
+    const width = Math.max(12, (x2 - x1) * scaleX);
+    const height = Math.max(12, (y2 - y1) * scaleY);
     const box = document.createElement("button");
     const classes = [
       "region-box",
@@ -517,8 +532,9 @@ function renderOverlays() {
     box.className = classes.join(" ");
     box.style.left = `${x1 * scaleX}px`;
     box.style.top = `${y1 * scaleY}px`;
-    box.style.width = `${Math.max(12, (x2 - x1) * scaleX)}px`;
-    box.style.height = `${Math.max(12, (y2 - y1) * scaleY)}px`;
+    box.style.width = `${width}px`;
+    box.style.height = `${height}px`;
+    box.style.transform = state.editorMode === "render" ? `rotate(${region.angle}deg)` : "";
     box.textContent = region.index + 1;
     box.onpointerdown = (event) => startBoxDrag(event, region.index, null);
     if (state.activeRegion === region.index) {
@@ -530,6 +546,20 @@ function renderOverlays() {
       });
     }
     overlay.append(box);
+    if (state.editorMode === "render" && state.activeRegion === region.index) {
+      const rotate = document.createElement("span");
+      const angleRad = region.angle * Math.PI / 180;
+      const centerX = x1 * scaleX + width / 2;
+      const centerY = y1 * scaleY + height / 2;
+      const offset = Math.max(height / 2 + 36, 46);
+      rotate.className = "rotate-handle";
+      rotate.title = "拖拽旋转译文框";
+      rotate.style.left = `${centerX + Math.sin(angleRad) * offset}px`;
+      rotate.style.top = `${centerY - Math.cos(angleRad) * offset}px`;
+      rotate.style.transform = `translate(-50%, -50%) rotate(${region.angle}deg)`;
+      rotate.onpointerdown = (event) => startBoxDrag(event, region.index, "rotate");
+      overlay.append(rotate);
+    }
   });
 }
 
@@ -566,7 +596,11 @@ function moveBoxDrag(event) {
   const dy = point.y - state.dragState.startPoint.y;
   let [x1, y1, x2, y2] = state.dragState.startBBox;
   const handle = state.dragState.handle;
-  if (!handle) {
+  if (handle === "rotate") {
+    const centerX = (x1 + x2) / 2;
+    const centerY = (y1 + y2) / 2;
+    setRegionAngle(region, Math.atan2(point.y - centerY, point.x - centerX) * 180 / Math.PI + 90);
+  } else if (!handle) {
     x1 += dx; x2 += dx; y1 += dy; y2 += dy;
   } else {
     if (handle.includes("w")) x1 += dx;
@@ -670,6 +704,7 @@ function addRegion() {
     enabled: true,
     text: "",
     translation: "",
+    angle: 0,
     font_size: null,
     direction: "auto",
     alignment: "left",

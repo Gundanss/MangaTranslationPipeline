@@ -25,6 +25,7 @@ class FakeRegion:
         self.font_size = 12
         self._direction = "auto"
         self._alignment = "auto"
+        self.angle = 0
         self.adjust_bg_color = True
         self._fg = np.array([0, 0, 0])
         self._bg = np.array([255, 255, 255])
@@ -121,6 +122,7 @@ def test_serialize_regions_includes_ocr_and_render_boxes():
     region.render_bbox = [5, 6, 7, 8]
     region.enabled = False
     region.mask_dilation_offset = 13
+    region.angle = 17.5
 
     data = serialize_regions([region])
 
@@ -129,6 +131,7 @@ def test_serialize_regions_includes_ocr_and_render_boxes():
     assert data[0]["render_bbox"] == [5, 6, 7, 8]
     assert data[0]["enabled"] is False
     assert data[0]["mask_dilation_offset"] == 13
+    assert data[0]["angle"] == 17.5
 
 
 def test_mask_refinement_groups_regions_by_dilation_offset():
@@ -340,7 +343,7 @@ def test_rerender_uses_clean_background_and_latest_translation(tmp_path, monkeyp
     Image.fromarray(clean).save(input_path)
 
     legacy_ctx = SimpleNamespace(
-        text_regions=[FakeRegion("old text")],
+        text_regions=[FakeRegion("old text"), FakeRegion("second old text")],
         img_rgb=clean.copy(),
         img_inpainted=rendered_old,
         img_rendered=rendered_old,
@@ -356,8 +359,12 @@ def test_rerender_uses_clean_background_and_latest_translation(tmp_path, monkeyp
 
         async def _run_text_rendering(self, config, ctx):
             assert ctx.text_regions[0].translation == "new text"
+            assert ctx.text_regions[1].translation == "second new text"
             assert ctx.text_regions[0].xyxy.tolist() == [1, 0, 3, 4]
+            assert ctx.text_regions[1].xyxy.tolist() == [0, 1, 4, 3]
             assert ctx.text_regions[0].target_lang == "CHS"
+            assert ctx.text_regions[1].target_lang == "CHS"
+            assert [region.angle for region in ctx.text_regions] == [14, -22]
             return ctx.img_inpainted + 5
 
     monkeypatch.setattr(
@@ -394,6 +401,20 @@ def test_rerender_uses_clean_background_and_latest_translation(tmp_path, monkeyp
                     "render_bbox": [1, 0, 3, 4],
                     "text": "edited source",
                     "translation": "new text",
+                    "angle": 14,
+                    "font_size": 18,
+                    "direction": "auto",
+                    "alignment": "center",
+                    "foreground": "#000000",
+                    "outline": "#FFFFFF",
+                },
+                {
+                    "index": 1,
+                    "ocr_bbox": [0, 0, 4, 4],
+                    "render_bbox": [0, 1, 4, 3],
+                    "text": "second edited source",
+                    "translation": "second new text",
+                    "angle": -22,
                     "font_size": 18,
                     "direction": "auto",
                     "alignment": "center",
@@ -405,6 +426,8 @@ def test_rerender_uses_clean_background_and_latest_translation(tmp_path, monkeyp
     )
 
     assert regions[0]["translation"] == "new text"
+    assert regions[1]["translation"] == "second new text"
+    assert [region["angle"] for region in regions] == [14, -22]
     assert np.array_equal(np.array(Image.open(output_path)), clean + 5)
 
     with context_path.open("rb") as file:
@@ -567,6 +590,7 @@ def test_reprocess_regions_returns_new_ocr_and_translation(tmp_path, monkeypatch
     region.ocr_bbox = [0, 0, 4, 4]
     region.render_bbox = [0, 0, 4, 4]
     region.enabled = True
+    region.angle = 33
     with context_path.open("wb") as file:
         pickle.dump(
             {
@@ -609,6 +633,7 @@ def test_reprocess_regions_returns_new_ocr_and_translation(tmp_path, monkeypatch
         async def _run_text_rendering(self, config, ctx):
             assert ctx.text_regions[0].text == "new ocr"
             assert ctx.text_regions[0].translation == "new translation"
+            assert ctx.text_regions[0].angle == 33
             ctx.img_inpainted[:] = clean + 7
             return ctx.img_inpainted
 
@@ -671,11 +696,13 @@ def test_reprocess_regions_returns_new_ocr_and_translation(tmp_path, monkeypatch
 
     assert regions[0]["text"] == "new ocr"
     assert regions[0]["translation"] == "new translation"
+    assert regions[0]["angle"] == 33
     assert np.array_equal(np.array(Image.open(output_path)), clean + 7)
     with context_path.open("rb") as file:
         payload = pickle.load(file)
     assert payload["text_regions"][0].text == "new ocr"
     assert payload["text_regions"][0].translation == "new translation"
+    assert payload["text_regions"][0].angle == 33
     assert np.array_equal(payload["img_inpainted"], clean)
 
 
@@ -779,6 +806,7 @@ def test_reprocess_manual_box_detects_and_merges_inner_textlines(
             assert ctx.text_regions[0].text == "右左"
             assert ctx.text_regions[0].translation == "合并译文"
             assert ctx.text_regions[0].target_lang == "CHS"
+            assert ctx.text_regions[0].angle == -18
             return clean + 9
 
     monkeypatch.setattr(engine, "_mps_available", lambda: False)
@@ -841,6 +869,7 @@ def test_reprocess_manual_box_detects_and_merges_inner_textlines(
                     "enabled": True,
                     "text": "",
                     "translation": "",
+                    "angle": -18,
                     "font_size": 24,
                     "direction": "auto",
                     "alignment": "auto",
@@ -854,6 +883,7 @@ def test_reprocess_manual_box_detects_and_merges_inner_textlines(
 
     assert regions[0]["text"] == "右左"
     assert regions[0]["translation"] == "合并译文"
+    assert regions[0]["angle"] == -18
     assert np.array_equal(np.array(Image.open(output_path)), clean + 9)
 
 

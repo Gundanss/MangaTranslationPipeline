@@ -61,7 +61,16 @@ async def lifespan(_: FastAPI):
 
 
 app = FastAPI(title="漫画翻译流水线", version="0.1.0", lifespan=lifespan)
-app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
+
+class NoStoreStaticFiles(StaticFiles):
+    def file_response(self, full_path, stat_result, scope, status_code=200):
+        response = super().file_response(full_path, stat_result, scope, status_code)
+        response.headers["Cache-Control"] = "no-store"
+        return response
+
+
+app.mount("/static", NoStoreStaticFiles(directory=STATIC_DIR), name="static")
 
 
 def _image_public(image: dict) -> dict:
@@ -125,6 +134,9 @@ def _normalize_region_json(regions: list[dict]) -> tuple[list[dict], bool]:
         if "mask_dilation_offset" not in item:
             item["mask_dilation_offset"] = 20
             changed = True
+        if "angle" not in item:
+            item["angle"] = 0
+            changed = True
         cleaned = sanitize_translation_text(item.get("translation", ""))
         if cleaned != item.get("translation", ""):
             item["translation"] = cleaned
@@ -173,7 +185,7 @@ def _ensure_service_writable() -> None:
 
 @app.get("/")
 async def index():
-    return FileResponse(STATIC_DIR / "index.html")
+    return FileResponse(STATIC_DIR / "index.html", headers={"Cache-Control": "no-store"})
 
 
 @app.get("/api/health")
