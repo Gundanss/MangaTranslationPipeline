@@ -40,6 +40,7 @@ from .providers import (
 from .schemas import (
     ReprocessRegionsRequest,
     RerenderRequest,
+    ResumeFromImageRequest,
     SettingsUpdate,
     TaskConfig,
     TranslateRegionRequest,
@@ -54,8 +55,10 @@ manager = TaskManager(database, secrets)
 LOCAL_CLIENTS = {"127.0.0.1", "::1", "localhost", "testclient"}
 
 
+# 应用生命周期与静态资源
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    """在 FastAPI 启动时拉起后台任务 worker。"""
     manager.start()
     yield
 
@@ -64,6 +67,8 @@ app = FastAPI(title="漫画翻译流水线", version="0.1.0", lifespan=lifespan)
 
 
 class NoStoreStaticFiles(StaticFiles):
+    """本地开发时禁用前端静态资源缓存。"""
+
     def file_response(self, full_path, stat_result, scope, status_code=200):
         response = super().file_response(full_path, stat_result, scope, status_code)
         response.headers["Cache-Control"] = "no-store"
@@ -73,7 +78,9 @@ class NoStoreStaticFiles(StaticFiles):
 app.mount("/static", NoStoreStaticFiles(directory=STATIC_DIR), name="static")
 
 
+# 对外响应结构
 def _image_public(image: dict) -> dict:
+    """只返回前端界面需要的图片字段和访问链接。"""
     return {
         "id": image["id"],
         "relative_path": image["relative_path"],
@@ -88,6 +95,7 @@ def _image_public(image: dict) -> dict:
 
 
 def _task_public(task: dict) -> dict:
+    """把数据库任务记录转成 static/app.js 使用的 JSON 结构。"""
     result = {
         key: task[key]
         for key in (
@@ -111,6 +119,7 @@ def _task_public(task: dict) -> dict:
 
 
 def _normalize_region_json(regions: list[dict]) -> tuple[list[dict], bool]:
+    """读取旧版 region JSON 时，补齐到当前编辑器所需字段。"""
     changed = False
     normalized: list[dict] = []
     for index, region in enumerate(regions):
@@ -145,7 +154,92 @@ def _normalize_region_json(regions: list[dict]) -> tuple[list[dict], bool]:
     return normalized, changed
 
 
+def _count_non_queued_images(images: list[dict], reset_ids: set[str] | None = None) -> int:
+    """在部分图片重新入队后，重新计算 completed_files。"""
+    blocked = reset_ids or set()
+    return sum(
+        1
+        for image in images
+        if image["id"] not in blocked and image.get("status") != "queued"
+    )
+
+
+async def _resume_task_from_image(
+    task_id: str,
+    image_id: str,
+    requested_by: str,
+) -> dict:
+    """从指定图片开始重置失败/停止页，并重新把任务放回队列。"""
+    task = database.get_task(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="任务不存在")
+
+    image = database.get_image(image_id)
+    if not image or image["task_id"] != task_id:
+        raise HTTPException(status_code=404, detail="图片不存在")
+
+    if task["status"] not in {"failed", "completed_with_errors", "stopped"}:
+        raise HTTPException(status_code=409, detail="只有已失败、部分失败或已停止的任务才能续跑")
+
+    target_index = next(
+        (index for index, item in enumerate(task["images"]) if item["id"] == image_id),
+        None,
+    )
+    if target_index is None:
+        raise HTTPException(status_code=404, detail="图片不属于当前任务")
+
+    reset_ids: set[str] = set()
+    for current in task["images"][target_index:]:
+        if current["status"] == "completed":
+            continue
+        # 从选中页开始，只重置未成功的页面；已完成页保留结果并继续可编辑。
+        database.update_image(
+            current["id"],
+            status="queued",
+            stage="retry",
+            progress=0.0,
+            error=None,
+        )
+        reset_ids.add(current["id"])
+
+    if not reset_ids:
+        raise HTTPException(status_code=409, detail="所选页面及其后续没有可续跑的失败或未完成图片")
+
+    total = max(1, task["total_files"])
+    processed = _count_non_queued_images(task["images"], reset_ids)
+    details = {
+        "requested_by": requested_by,
+        "start_image_id": image_id,
+        "start_image_path": image["relative_path"],
+        "requeued_image_ids": sorted(reset_ids),
+        "requeued_count": len(reset_ids),
+    }
+    database.update_task(
+        task_id,
+        status="queued",
+        current_stage="retry",
+        completed_files=processed,
+        progress=processed / total,
+        error=None,
+    )
+    database.log(
+        task_id,
+        "INFO",
+        "retry",
+        f"{requested_by} 触发从 {image['relative_path']} 开始续跑，重新排队 {len(reset_ids)} 张图片",
+        image_id=image_id,
+        details=details,
+    )
+    await manager.enqueue(task_id)
+    resumed = database.get_task(task_id)
+    if not resumed:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    return resumed
+
+
+# 共享校验与安全保护
 async def _validate_config(config: TaskConfig) -> None:
+    """在复制上传文件和创建任务前，先校验翻译配置是否可用。"""
     settings = secrets.get()
     try:
         create_provider(config.provider, settings, config.ollama_model)
@@ -173,16 +267,19 @@ async def _validate_config(config: TaskConfig) -> None:
 
 
 def _require_local_request(request: Request) -> None:
+    """限制停止服务接口只能由本机访问。"""
     host = request.client.host if request.client else None
     if host not in LOCAL_CLIENTS:
         raise HTTPException(status_code=403, detail="仅允许本机请求停止本地服务")
 
 
 def _ensure_service_writable() -> None:
+    """一旦进入优雅停机流程，就阻止新的写操作。"""
     if manager.is_shutting_down:
         raise HTTPException(status_code=503, detail="服务正在停止，暂不接受新的处理请求")
 
 
+# 基础状态路由
 @app.get("/")
 async def index():
     return FileResponse(STATIC_DIR / "index.html", headers={"Cache-Control": "no-store"})
@@ -190,6 +287,7 @@ async def index():
 
 @app.get("/api/health")
 async def health():
+    """返回运行时健康状态，供头部状态提示使用。"""
     required_models = {
         "ctd": MODEL_DIR / "detection" / "comictextdetector.pt.onnx",
         "ocr": MODEL_DIR / "ocr" / "ocr_ar_48px.ckpt",
@@ -217,6 +315,7 @@ async def update_settings(update: SettingsUpdate):
 
 @app.get("/api/ollama/models")
 async def ollama_models():
+    """暴露本机已安装的 Ollama 模型；应用本身不会自动下载模型。"""
     settings = secrets.get()
     try:
         models = await list_ollama_models(settings["ollama_base_url"])
@@ -225,12 +324,14 @@ async def ollama_models():
     return {"models": models, "base_url": settings["ollama_base_url"]}
 
 
+# 任务生命周期路由
 @app.post("/api/tasks")
 async def create_task(
     files: list[UploadFile] = File(...),
     config_json: str = Form(...),
     relative_paths: list[str] = Form(default=[]),
 ):
+    """创建批量任务、落盘上传图片，并加入处理队列。"""
     _ensure_service_writable()
     try:
         config = TaskConfig.model_validate_json(config_json)
@@ -298,6 +399,7 @@ async def create_task(
 
 @app.post("/api/system/shutdown")
 async def shutdown_system(request: Request, background_tasks: BackgroundTasks):
+    """通知本地 worker 先处理完当前图片，再停止服务。"""
     _require_local_request(request)
     payload = {
         "ok": True,
@@ -330,8 +432,25 @@ async def get_task(task_id: str):
     return _task_public(task)
 
 
+@app.post("/api/tasks/{task_id}/resume-from-image")
+async def resume_task_from_image(
+    task_id: str,
+    request: ResumeFromImageRequest,
+    client_request: Request,
+):
+    """从某张图片卡片处恢复失败或已停止的任务。"""
+    _ensure_service_writable()
+    resumed = await _resume_task_from_image(
+        task_id,
+        request.image_id,
+        client_request.client.host if client_request.client else "unknown",
+    )
+    return _task_public(resumed)
+
+
 @app.get("/api/tasks/{task_id}/events")
 async def task_events(task_id: str, request: Request):
+    """向活动任务面板持续推送任务快照和增量日志。"""
     if not database.get_task(task_id):
         raise HTTPException(status_code=404, detail="任务不存在")
 
@@ -353,8 +472,10 @@ async def task_events(task_id: str, request: Request):
     )
 
 
+# 图片与编辑器相关路由
 @app.get("/api/images/{image_id}/file/{kind}")
 async def image_file(image_id: str, kind: str):
+    """返回原图文件，或最新一次渲染后的结果图。"""
     image = database.get_image(image_id)
     if not image:
         raise HTTPException(status_code=404, detail="图片不存在")
@@ -371,6 +492,7 @@ async def image_file(image_id: str, kind: str):
 
 @app.get("/api/images/{image_id}/regions")
 async def get_regions(image_id: str):
+    """加载已完成图片的可编辑 OCR 框与渲染框。"""
     image = database.get_image(image_id)
     if not image:
         raise HTTPException(status_code=404, detail="图片不存在")
@@ -392,6 +514,7 @@ async def get_regions(image_id: str):
 
 @app.post("/api/images/{image_id}/rerender")
 async def rerender_image(image_id: str, request: RerenderRequest):
+    """保存人工修改后的文本/排版，并在干净底图上重新嵌字。"""
     _ensure_service_writable()
     image = database.get_image(image_id)
     if not image:
@@ -423,6 +546,7 @@ async def rerender_image(image_id: str, request: RerenderRequest):
 
 @app.post("/api/images/{image_id}/reprocess-regions")
 async def reprocess_regions(image_id: str, request: ReprocessRegionsRequest):
+    """对变更过的 OCR 框重新执行 OCR、翻译、去字和嵌字。"""
     _ensure_service_writable()
     image = database.get_image(image_id)
     if not image:
@@ -461,6 +585,7 @@ async def reprocess_regions(image_id: str, request: ReprocessRegionsRequest):
 
 @app.post("/api/images/{image_id}/translate-region")
 async def translate_region(image_id: str, request: TranslateRegionRequest):
+    """单独翻译编辑器里的一个区域，但不立刻写回磁盘。"""
     _ensure_service_writable()
     image = database.get_image(image_id)
     if not image:
@@ -485,6 +610,8 @@ async def translate_region(image_id: str, request: TranslateRegionRequest):
         provider = create_provider(provider_name, settings, None)
         label = "机器翻译"
     else:
+        # 区域级 Ollama 翻译优先复用任务模型，其次回退到最近手动选择的模型，
+        # 这样较早创建的在线翻译任务也能单独用 Ollama 修一句。
         model = (
             config.get("ollama_model")
             or config.get("polish_model")
@@ -541,4 +668,5 @@ async def translate_region(image_id: str, request: TranslateRegionRequest):
 
 @app.exception_handler(Exception)
 async def unhandled_exception(_: Request, exc: Exception):
+    """把未捕获异常统一转成 JSON，方便前端 fetch 直接展示。"""
     return JSONResponse(status_code=500, content={"detail": str(exc)})
