@@ -497,10 +497,30 @@ function clampBBox(bbox) {
 
 function markOcrDirty(index) {
   state.dirtyOcrIndices.add(index);
+  updateReprocessButtonLabel();
 }
 
 function markMaskDirty(index) {
   state.dirtyMaskIndices.add(index);
+  updateReprocessButtonLabel();
+}
+
+function updateReprocessButtonLabel() {
+  // 重点：按钮文案跟随待处理类型，避免用户以为涂抹强度没有“重新去字”入口。
+  const button = $("reprocessButton");
+  if (!button) return;
+  const hasOcrChange = [...state.dirtyOcrIndices].some((index) => state.regions[index]);
+  const hasMaskChange = [...state.dirtyMaskIndices].some((index) => state.regions[index]);
+  if (hasOcrChange && hasMaskChange) {
+    button.textContent = "重新识别并重新去字";
+    button.title = "会重新识别文字，并按当前涂抹强度重新生成干净底图后嵌字";
+  } else if (hasMaskChange) {
+    button.textContent = "重新去字并嵌字";
+    button.title = "会按当前涂抹强度重新生成干净底图，然后嵌入译文";
+  } else {
+    button.textContent = "重新识别文字并嵌字";
+    button.title = "只重新识别文字、翻译并嵌字，默认复用已有干净底图";
+  }
 }
 
 function setRegionBBox(region, bbox) {
@@ -578,6 +598,7 @@ async function openImage(image) {
   state.activeRegion = null;
   state.dirtyOcrIndices.clear();
   state.dirtyMaskIndices.clear();
+  updateReprocessButtonLabel();
   try {
     const data = await api(image.regions_url);
     state.regions = data.regions.map(ensureRegionShape);
@@ -893,6 +914,7 @@ async function reprocessRegions() {
     };
     state.dirtyOcrIndices.clear();
     state.dirtyMaskIndices.clear();
+    updateReprocessButtonLabel();
     if (state.activeRegion !== null && state.activeRegion >= state.regions.length) {
       state.activeRegion = state.regions.length ? state.regions.length - 1 : null;
     }
@@ -1151,6 +1173,7 @@ function escapeHtml(value) {
 
 function bindEvents() {
   // 所有事件绑定集中在这里，后续排查 DOM 交互会更清晰。
+  updateReprocessButtonLabel();
   $("singleButton").onclick = () => $("singleInput").click();
   $("folderButton").onclick = () => $("folderInput").click();
   $("singleInput").onchange = (event) => setFiles(event.target.files);

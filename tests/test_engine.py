@@ -184,6 +184,7 @@ def test_reprocess_mask_only_change_does_not_run_ocr(tmp_path, monkeypatch):
     region.ocr_bbox = [0, 0, 3, 3]
     region.render_bbox = [0, 0, 3, 3]
     region.mask_dilation_offset = 20
+    region.mask_lines = [np.array([[0, 0], [2, 0], [2, 2], [0, 2]], dtype=np.int32)]
     with context_path.open("wb") as file:
         pickle.dump(
             {
@@ -208,6 +209,7 @@ def test_reprocess_mask_only_change_does_not_run_ocr(tmp_path, monkeypatch):
 
         async def _run_mask_refinement(self, config, ctx):
             mask_offsets.append(config.mask_dilation_offset)
+            assert int(ctx.mask_raw.sum() / 255) == 9
             return np.ones((4, 4), dtype=np.uint8) * 255
 
         async def _run_inpainting(self, config, ctx):
@@ -271,6 +273,12 @@ def test_reprocess_mask_only_change_does_not_run_ocr(tmp_path, monkeypatch):
     assert regions[0]["translation"] == "old translation"
     assert regions[0]["mask_dilation_offset"] == 13
     assert np.array_equal(np.array(Image.open(output_path)), clean + 2)
+    with context_path.open("rb") as file:
+        payload = pickle.load(file)
+    assert np.array_equal(
+        payload["text_regions"][0].mask_lines[0],
+        np.array([[0, 0], [2, 0], [2, 2], [0, 2]], dtype=np.int32),
+    )
 
 
 def test_fit_region_font_size_shrinks_to_render_box(monkeypatch):

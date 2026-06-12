@@ -317,6 +317,50 @@ def _set_region_geometry(region: Any, bbox: list[int]) -> None:
     _clear_geometry_cache(region)
 
 
+def _polygons_from_lines(lines: Any) -> list[np.ndarray]:
+    """把 TextBlock/TextLine 的多边形统一成 cv2 可填充的 int32 点集。"""
+    if lines is None:
+        return []
+    if isinstance(lines, np.ndarray) and lines.ndim == 2 and lines.shape[-1] == 2:
+        lines = [lines]
+    polygons: list[np.ndarray] = []
+    for line in lines:
+        points = getattr(line, "pts", line)
+        array = np.asarray(points)
+        if array.size < 6:
+            continue
+        array = array.reshape(-1, 2)
+        if not np.isfinite(array).all():
+            continue
+        polygons.append(np.rint(array).astype(np.int32))
+    return polygons
+
+
+def _copy_region_lines(lines: Any) -> list[np.ndarray]:
+    return [polygon.copy() for polygon in _polygons_from_lines(lines)]
+
+
+def _ensure_region_mask_lines(region: Any) -> None:
+    """重点：保存去字专用细边界，避免渲染阶段改写 lines 后丢失原始 mask 几何。"""
+    if getattr(region, "mask_lines", None) is not None:
+        return
+    copied = _copy_region_lines(getattr(region, "lines", None))
+    if copied:
+        region.mask_lines = copied
+
+
+def _region_mask_polygons(region: Any) -> list[np.ndarray]:
+    """去字优先用自动检测保存的细边界，缺失时才退回 OCR 矩形。"""
+    mask_lines = getattr(region, "mask_lines", None)
+    polygons = _polygons_from_lines(mask_lines)
+    if polygons:
+        return polygons
+    polygons = _polygons_from_lines(getattr(region, "lines", None))
+    if polygons:
+        return polygons
+    return [_bbox_to_polygon(getattr(region, "ocr_bbox", _region_bbox(region)))]
+
+
 def _bbox_from_update(update: dict[str, Any], name: str, fallback: list[int]) -> list[int]:
     return update.get(name) or update.get("bbox") or fallback
 
@@ -551,20 +595,20 @@ def _make_text_region(
     _update_bbox_fields(block, bbox, bbox)
     _set_region_font_preference(block, font_size)
     _set_region_mask_dilation_offset(block, mask_dilation_offset)
+    _ensure_region_mask_lines(block)
     return block
 
 
 def _make_mask_from_regions(
     shape: tuple[int, int, int] | tuple[int, int], regions: list[Any]
 ) -> np.ndarray:
-    """先用 OCR 框生成粗略文本掩膜，再交给后续细化。"""
+    """先用保存的细文字边界生成掩膜，再交给后续细化。"""
     height, width = shape[:2]
     mask = np.zeros((height, width), dtype=np.uint8)
     for region in regions:
         if not _region_enabled(region):
             continue
-        bbox = getattr(region, "ocr_bbox", _region_bbox(region))
-        cv2.fillPoly(mask, [_bbox_to_polygon(bbox)], 255)
+        cv2.fillPoly(mask, _region_mask_polygons(region), 255)
     return mask
 
 
@@ -628,6 +672,7 @@ def _ensure_payload_region_boxes(payload: dict[str, Any]) -> dict[str, Any]:
         _set_region_mask_dilation_offset(region, _region_mask_dilation_offset(region))
         if config is not None:
             _prepare_region_for_render(region, config)
+        _ensure_region_mask_lines(region)
     return payload
 
 
@@ -1801,6 +1846,7 @@ class CoreEngine:
                 new_region_indices.add(update["index"])
             else:
                 region = old_region
+                _ensure_region_mask_lines(region)
                 region.text = update.get("text", "")
                 region.translation = sanitize_translation_text(
                     update.get("translation", "")
@@ -1822,7 +1868,9 @@ class CoreEngine:
             _set_region_mask_dilation_offset(region, update["mask_dilation_offset"])
             _set_region_angle(region, update["angle"])
             _update_bbox_fields(region, update["ocr_bbox"], update["render_bbox"])
-            _set_region_geometry(region, update["ocr_bbox"])
+            if old_region is None:
+                _set_region_geometry(region, update["ocr_bbox"])
+                _ensure_region_mask_lines(region)
             all_regions.append(region)
             if update["enabled"] and update["index"] in changed:
                 reocr_slots.append(update["index"])
@@ -1901,10 +1949,8 @@ class CoreEngine:
         ctx.text_regions = enabled_regions
         if enabled_regions and rebuild_clean:
             for region in enabled_regions:
+                _ensure_region_mask_lines(region)
                 _prepare_region_for_render(region, config)
-                _set_region_geometry(
-                    region, getattr(region, "ocr_bbox", _region_bbox(region))
-                )
             ctx.mask = await _run_mask_refinement_by_region_offsets(
                 translator, config, payload["img_rgb"], enabled_regions
             )
