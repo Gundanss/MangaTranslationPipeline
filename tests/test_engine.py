@@ -578,12 +578,13 @@ def test_process_keeps_image_and_saves_empty_regions_when_no_text(
 
 
 def test_reprocess_regions_returns_new_ocr_and_translation(tmp_path, monkeypatch):
-    clean = np.zeros((4, 4, 3), dtype=np.uint8)
+    source = np.zeros((4, 4, 3), dtype=np.uint8)
+    trusted_clean = np.ones((4, 4, 3), dtype=np.uint8) * 5
     input_path = tmp_path / "input.png"
     output_path = tmp_path / "output.png"
     context_path = tmp_path / "context.pkl"
     regions_path = tmp_path / "regions.json"
-    Image.fromarray(clean).save(input_path)
+    Image.fromarray(source).save(input_path)
 
     region = FakeRegion("old text")
     region.text = "old text"
@@ -596,8 +597,8 @@ def test_reprocess_regions_returns_new_ocr_and_translation(tmp_path, monkeypatch
             {
                 "config": SimpleNamespace(),
                 "text_regions": [region],
-                "img_rgb": clean.copy(),
-                "img_inpainted": clean.copy(),
+                "img_rgb": source.copy(),
+                "img_inpainted": trusted_clean.copy(),
                 "img_alpha": None,
                 "clean_image_trusted": True,
             },
@@ -625,16 +626,17 @@ def test_reprocess_regions_returns_new_ocr_and_translation(tmp_path, monkeypatch
             ]
 
         async def _run_mask_refinement(self, config, ctx):
-            return np.zeros((4, 4), dtype=np.uint8)
+            raise AssertionError("旧 OCR 框纯重识别不应重新生成 mask")
 
         async def _run_inpainting(self, config, ctx):
-            return clean.copy()
+            raise AssertionError("旧 OCR 框纯重识别不应重新去字")
 
         async def _run_text_rendering(self, config, ctx):
             assert ctx.text_regions[0].text == "new ocr"
             assert ctx.text_regions[0].translation == "new translation"
             assert ctx.text_regions[0].angle == 33
-            ctx.img_inpainted[:] = clean + 7
+            assert np.array_equal(ctx.img_inpainted, trusted_clean)
+            ctx.img_inpainted[:] = trusted_clean + 7
             return ctx.img_inpainted
 
     monkeypatch.setattr(engine, "_mps_available", lambda: False)
@@ -697,13 +699,13 @@ def test_reprocess_regions_returns_new_ocr_and_translation(tmp_path, monkeypatch
     assert regions[0]["text"] == "new ocr"
     assert regions[0]["translation"] == "new translation"
     assert regions[0]["angle"] == 33
-    assert np.array_equal(np.array(Image.open(output_path)), clean + 7)
+    assert np.array_equal(np.array(Image.open(output_path)), trusted_clean + 7)
     with context_path.open("rb") as file:
         payload = pickle.load(file)
     assert payload["text_regions"][0].text == "new ocr"
     assert payload["text_regions"][0].translation == "new translation"
     assert payload["text_regions"][0].angle == 33
-    assert np.array_equal(payload["img_inpainted"], clean)
+    assert np.array_equal(payload["img_inpainted"], trusted_clean)
 
 
 def test_reprocess_manual_box_detects_and_merges_inner_textlines(
@@ -724,6 +726,7 @@ def test_reprocess_manual_box_detects_and_merges_inner_textlines(
                 "img_rgb": clean.copy(),
                 "img_inpainted": clean.copy(),
                 "img_alpha": None,
+                "clean_image_trusted": True,
             },
             file,
         )
@@ -767,6 +770,8 @@ def test_reprocess_manual_box_detects_and_merges_inner_textlines(
             super().__init__("")
             self.text = text
 
+    repaint_calls = []
+
     class FakeTranslator:
         def add_progress_hook(self, _hook):
             return None
@@ -797,9 +802,11 @@ def test_reprocess_manual_box_detects_and_merges_inner_textlines(
             return [FakeMergedRegion("右"), FakeMergedRegion("左")]
 
         async def _run_mask_refinement(self, config, ctx):
+            repaint_calls.append("mask")
             return np.zeros((12, 12), dtype=np.uint8)
 
         async def _run_inpainting(self, config, ctx):
+            repaint_calls.append("inpaint")
             return clean.copy()
 
         async def _run_text_rendering(self, config, ctx):
@@ -884,6 +891,7 @@ def test_reprocess_manual_box_detects_and_merges_inner_textlines(
     assert regions[0]["text"] == "右左"
     assert regions[0]["translation"] == "合并译文"
     assert regions[0]["angle"] == -18
+    assert repaint_calls == ["mask", "inpaint"]
     assert np.array_equal(np.array(Image.open(output_path)), clean + 9)
 
 

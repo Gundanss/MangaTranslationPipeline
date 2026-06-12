@@ -1778,6 +1778,7 @@ class CoreEngine:
 
         all_regions: list[Any] = []
         reocr_slots: list[int] = []
+        new_region_indices: set[int] = set()
         for update in updates:
             old_region = (
                 existing_regions[update["index"]]
@@ -1797,6 +1798,7 @@ class CoreEngine:
                     update["angle"],
                 )
                 changed.add(update["index"])
+                new_region_indices.add(update["index"])
             else:
                 region = old_region
                 region.text = update.get("text", "")
@@ -1877,11 +1879,32 @@ class CoreEngine:
             )
 
         enabled_regions = [region for region in all_regions if _region_enabled(region)]
-        for region in enabled_regions:
-            _prepare_region_for_render(region, config)
-            _set_region_geometry(region, getattr(region, "ocr_bbox", _region_bbox(region)))
+        clean_inpainted = _image_array_for_png(payload.get("img_inpainted"))
+        trusted_clean = (
+            bool(payload.get("clean_image_trusted")) and clean_inpainted is not None
+        )
+        mask_changed = {
+            index
+            for index in mask_changed_indices
+            if 0 <= index < len(all_regions)
+        }
+        new_enabled_regions = {
+            index
+            for index in new_region_indices
+            if index < len(all_regions) and _region_enabled(all_regions[index])
+        }
+        # 重点：人工拖动已有 OCR 框通常只是为了读字更准，不应重建 clean。
+        # 只有新增区域、涂抹强度/启用状态变化，或旧 clean 不可信时才重新去字。
+        rebuild_clean = bool(enabled_regions) and (
+            bool(mask_changed) or bool(new_enabled_regions) or not trusted_clean
+        )
         ctx.text_regions = enabled_regions
-        if enabled_regions:
+        if enabled_regions and rebuild_clean:
+            for region in enabled_regions:
+                _prepare_region_for_render(region, config)
+                _set_region_geometry(
+                    region, getattr(region, "ocr_bbox", _region_bbox(region))
+                )
             ctx.mask = await _run_mask_refinement_by_region_offsets(
                 translator, config, payload["img_rgb"], enabled_regions
             )
@@ -1889,6 +1912,26 @@ class CoreEngine:
             clean_inpainted = _image_array_for_png(ctx.img_inpainted)
             if clean_inpainted is None:
                 raise RuntimeError("重新生成干净底图失败")
+            ctx.img_inpainted = _copy_image_array(clean_inpainted)
+            for region in enabled_regions:
+                _set_region_geometry(
+                    region, getattr(region, "render_bbox", _region_bbox(region))
+                )
+                _prepare_region_for_render(region, config)
+                region.font_size = _fit_region_font_size(region, config)
+            ctx.text_regions = enabled_regions
+            rendered = await translator._run_text_rendering(config, ctx)
+        elif enabled_regions:
+            if clean_inpainted is None:
+                raise RuntimeError("缺少可复用的干净底图")
+            # 复用旧 clean 可以避开用户大框造成的矩形 mask，防止人物/气泡边缘被 LaMa 重绘。
+            await self.log_callback(
+                "INFO",
+                "manual-ocr",
+                "复用已有干净底图，仅重新识别文字并嵌字",
+                None,
+            )
+            clean_inpainted = _copy_image_array(clean_inpainted)
             ctx.img_inpainted = _copy_image_array(clean_inpainted)
             for region in enabled_regions:
                 _set_region_geometry(

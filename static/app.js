@@ -846,7 +846,7 @@ function toggleRegion() {
 }
 
 async function reprocessRegions() {
-  // reprocess 比 rerender 更重：可能会 OCR、翻译、去字，再重绘。
+  // 文字重识别默认复用干净底图；涂抹变化才会重新去字。
   if (state.serverStopping || state.serverStopped) {
     $("editorMessage").textContent = "服务已停止，重新启动后才能重新识别";
     return;
@@ -860,14 +860,19 @@ async function reprocessRegions() {
   const changed = [...state.dirtyOcrIndices].filter((index) => state.regions[index]);
   const maskChanged = [...state.dirtyMaskIndices].filter((index) => state.regions[index]);
   if (!changed.length && !maskChanged.length) {
-    $("editorMessage").textContent = "没有需要重新识别或重新去字的 OCR 框";
+    $("editorMessage").textContent = "没有需要重新识别文字或重新去字的 OCR 框";
     return;
   }
   $("reprocessButton").disabled = true;
   $("rerenderButton").disabled = true;
-  $("editorMessage").textContent = changed.length
-    ? "正在重新识别、翻译、去字并嵌字..."
-    : "正在按新的去字范围重新处理并嵌字...";
+  const willRepaint = maskChanged.length > 0;
+  let message = "正在重新识别文字、翻译并嵌字...";
+  if (changed.length && willRepaint) {
+    message = "正在重新识别文字，并按新的涂抹强度重新去字后嵌字...";
+  } else if (willRepaint) {
+    message = "正在按新的涂抹强度重新去字，并嵌入译文...";
+  }
+  $("editorMessage").textContent = message;
   try {
     const data = await api(`/api/images/${state.activeImage.id}/reprocess-regions`, {
       method: "POST",
