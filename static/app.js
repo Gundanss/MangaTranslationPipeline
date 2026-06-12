@@ -389,10 +389,22 @@ function normalizeMaskDilationOffset(value) {
   return Math.max(0, Math.min(40, Math.round(parsed)));
 }
 
+function maskDilationStrengthText(value) {
+  if (value <= 8) return "轻";
+  if (value <= 16) return "偏轻";
+  if (value <= 24) return "标准";
+  if (value <= 32) return "偏强";
+  return "强";
+}
+
+function formatMaskDilationLabel(value) {
+  return `${value} / 40 · ${maskDilationStrengthText(value)}`;
+}
+
 function updateMaskDilationLabel(inputId, labelId) {
   const value = normalizeMaskDilationOffset($(inputId).value);
   $(inputId).value = value;
-  $(labelId).textContent = value;
+  $(labelId).textContent = formatMaskDilationLabel(value);
   return value;
 }
 
@@ -449,6 +461,18 @@ function bboxField() {
 
 function getRegionBBox(region) {
   return [...(region[bboxField()] || region.bbox || [0, 0, 80, 80])];
+}
+
+function getMaskPreviewBBox(region) {
+  // 去字强度作用在 OCR 框对应的掩膜外扩上，预览也固定按 OCR 框计算。
+  const source = [...(region.ocr_bbox || region.bbox || region.render_bbox || [0, 0, 80, 80])];
+  const padding = normalizeMaskDilationOffset(region.mask_dilation_offset);
+  return clampBBox([
+    source[0] - padding,
+    source[1] - padding,
+    source[2] + padding,
+    source[3] + padding,
+  ]);
 }
 
 function imagePixelSize() {
@@ -586,6 +610,21 @@ function renderOverlays() {
   overlay.innerHTML = "";
   state.regions.forEach((region, index) => {
     ensureRegionShape(region, index);
+    if (state.activeRegion === region.index && region.enabled) {
+      // 预览层只做前端提示，不影响真实保存值和后端去字逻辑。
+      const [px1, py1, px2, py2] = getMaskPreviewBBox(region);
+      const preview = document.createElement("div");
+      preview.className = "mask-preview";
+      preview.style.left = `${px1 * scaleX}px`;
+      preview.style.top = `${py1 * scaleY}px`;
+      preview.style.width = `${Math.max(12, (px2 - px1) * scaleX)}px`;
+      preview.style.height = `${Math.max(12, (py2 - py1) * scaleY)}px`;
+      const label = document.createElement("span");
+      label.className = "mask-preview-label";
+      label.textContent = "预估涂抹范围";
+      preview.append(label);
+      overlay.append(preview);
+    }
     const [x1, y1, x2, y2] = getRegionBBox(region);
     const width = Math.max(12, (x2 - x1) * scaleX);
     const height = Math.max(12, (y2 - y1) * scaleY);
@@ -1133,9 +1172,12 @@ function bindEvents() {
     const value = updateMaskDilationLabel("regionMaskDilationOffset", "regionMaskDilationValue");
     if (state.activeRegion === null) return;
     const region = state.regions[state.activeRegion];
-    if (!region || region.mask_dilation_offset === value) return;
-    region.mask_dilation_offset = value;
-    markMaskDirty(region.index);
+    if (!region) return;
+    if (region.mask_dilation_offset !== value) {
+      region.mask_dilation_offset = value;
+      markMaskDirty(region.index);
+    }
+    renderOverlays();
   };
   $("clearLogView").onclick = () => {
     state.logs.clear();

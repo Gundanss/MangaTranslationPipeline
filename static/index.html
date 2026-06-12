@@ -126,10 +126,12 @@
 
           <label class="field slider-field">
             <span class="label-row">
-              <span>全局去字范围</span>
-              <strong id="globalMaskDilationValue">20</strong>
+              <span>涂抹强度</span>
+              <strong id="globalMaskDilationValue">20 / 40 · 标准</strong>
             </span>
             <input id="globalMaskDilationOffset" type="range" min="0" max="40" value="20" />
+            <p class="field-help">数值越大，去字时会向文字外侧多涂抹一些；过大可能吃掉线条，建议先用默认 20。</p>
+            <p class="field-help">这里设置整批图片的默认强度；单个 OCR 框可在右侧继续细调。</p>
           </label>
 
           <button id="startButton" class="button primary full" type="button">开始翻译</button>
@@ -230,10 +232,12 @@
                   </label>
                   <label class="field slider-field">
                     <span class="label-row">
-                      <span>去字范围</span>
-                      <strong id="regionMaskDilationValue">20</strong>
+                      <span>涂抹强度</span>
+                      <strong id="regionMaskDilationValue">20 / 40 · 标准</strong>
                     </span>
                     <input id="regionMaskDilationOffset" type="range" min="0" max="40" value="20" />
+                    <p class="field-help">数值越大，去字时会向文字外侧多涂抹一些；过大可能吃掉线条，建议先用默认 20。</p>
+                    <p class="field-help">左侧浅色外扩框会实时预估这次去字的覆盖范围。</p>
                   </label>
                   <div class="grid-two">
                     <label class="field">
